@@ -21,6 +21,7 @@ Hetzner        Atom feed listing only current and upcoming notices
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import os
 import re
@@ -132,6 +133,9 @@ HETZNER_STATUS = re.compile(r"<strong>\s*([^<]+?)\s*</strong>", re.IGNORECASE)
 HETZNER_DONE = {"resolved", "completed", "finished"}
 HETZNER_MAINTENANCE_WORDS = {"planned", "scheduled", "in_progress", "in progress", "completed"}
 HETZNER_START = re.compile(r"<p>\s*Start:\s*([0-9T:+\-]+)\s*</p>")
+# The notice's own schedule lines, which the summary leaves out: the dates are
+# already in the incident's start and update times.
+HETZNER_SCHEDULE = re.compile(r"<p>\s*(?:Start|Estimated end|End):[^<]*</p>", re.IGNORECASE)
 
 
 # ─── Data model ─────────────────────────────────────────────────────────────
@@ -173,8 +177,8 @@ class FeedErrors:
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
-def _clean(html: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", html or "")
+def _clean(markup: str) -> str:
+    text = html.unescape(re.sub(r"<[^>]+>", " ", markup or ""))
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -536,7 +540,7 @@ def hetzner_entry(entry) -> tuple[str, Optional[FeedEntry]]:
         content = entry["content"][0].get("value", "")
     content = content or entry.get("summary", "")
     categories = [t.get("term", "") for t in entry.get("tags") or []]
-    text = _clean(content)
+    text = _clean(HETZNER_SCHEDULE.sub(" ", content))
 
     matched = _match_regions(HETZNER_REGIONS, " | ".join([title, *categories, text]))
     if not matched:

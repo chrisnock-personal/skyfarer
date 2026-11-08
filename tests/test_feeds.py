@@ -178,7 +178,7 @@ class Hetzner(unittest.TestCase):
         self.assertEqual(routers.region, "Network")
         self.assertTrue(routers.is_maintenance)
         self.assertFalse(routers.is_resolved)
-        self.assertTrue(routers.summary.startswith("In progress:"))
+        self.assertTrue(routers.summary.startswith("In progress: We are currently"))
         self.assertEqual(routers.published_dt.isoformat(), "2026-10-15T10:00:00+00:00")
 
         outage = by_title["Cloud servers unreachable in FSN1-DC14"]
@@ -204,6 +204,13 @@ class Hetzner(unittest.TestCase):
         with mock.patch.object(feeds, "HETZNER_REGIONS", ["*"]), \
                 mock.patch.object(feeds, "_parse", lambda *a: None):
             self.assertEqual(feeds.fetch_hetzner_entries(errors), ([], None))
+
+
+class Cleaning(unittest.TestCase):
+    def test_entities_are_decoded(self):
+        # As in OVH's feed: "Nov 9 , 07:00 UTC &nbsp;-&nbsp; Nov 10".
+        self.assertEqual(feeds._clean("Nov 9&nbsp;-&nbsp;Nov 10 <b>R&amp;D</b>"),
+                         "Nov 9 - Nov 10 R&D")
 
 
 class Providers(unittest.TestCase):

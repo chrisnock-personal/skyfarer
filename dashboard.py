@@ -359,7 +359,8 @@ def index():
         notifications=fetch_notifications(start, end),
         channel_labels=CHANNEL_LABELS,
         region_count=sum(len(p["regions"].split(", ")) for p in providers),
-        poll_minutes=max(1, POLL_INTERVAL // 60),
+        poll_every=(f"{POLL_INTERVAL // 60} min" if POLL_INTERVAL % 60 == 0
+                    else f"{POLL_INTERVAL} s"),
         state=state, provider=provider, q=q,
         range_key=range_key, range_labels=RANGE_LABELS, state_labels=STATE_LABELS,
         from_date=from_date, to_date=to_date,

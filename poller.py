@@ -268,7 +268,12 @@ def poll_once(dry_run: bool = False) -> tuple[int, int]:
                     if not entry.is_resolved:
                         created += 1
                 elif entry.guid in open_incidents and entry.is_resolved:
-                    _resolve_incident(conn, open_incidents[entry.guid], entry, dry_run)
+                    rec = open_incidents[entry.guid]
+                    # Show how it ended, not how it began.
+                    db.refresh_incident(conn, rec["id"], title=entry.title,
+                                        summary=entry.summary, link=entry.link,
+                                        feed_updated=entry.updated, added_updates=0)
+                    _resolve_incident(conn, rec, entry, dry_run)
                     resolved += 1
 
             for provider in GROUPED_PROVIDERS:
