@@ -347,8 +347,9 @@
               </td>
               <td class="num sub" style="text-align: right">{{ row.update_count or "—" }}</td>
               <td class="nowrap mono" style="font-size: 13px">
-                {% if row.ticket_url %}<a href="{{ row.ticket_url }}" target="_blank" rel="noopener">#{{ row.ticket_id }}</a>
-                {% elif row.ticket_id %}#{{ row.ticket_id }}{% else %}<span style="color: var(--muted)">—</span>{% endif %}
+                {% for t in row.tickets %}
+                  <div>{% if t.url %}<a href="{{ t.url }}" target="_blank" rel="noopener">{{ t.label }}</a>{% else %}{{ t.label }}{% endif %}</div>
+                {% else %}<span style="color: var(--muted)">—</span>{% endfor %}
               </td>
               <td class="nowrap num sub">{{ row.detected_at.strftime('%d %b %H:%M') }}</td>
               <td class="nowrap num sub">{{ row.duration }}</td>

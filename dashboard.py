@@ -40,8 +40,8 @@ STATE_LABELS = [("open", "Active"), ("resolved", "Resolved"), ("all", "All")]
 # How each provider is shown; the database keeps the short names.
 PROVIDER_LABELS = {"GCP": "Google Cloud", "OVH": "OVHcloud"}
 CHANNEL_LABELS = {
-    "zendesk": "Zendesk", "pushover": "Pushover", "pagerduty": "PagerDuty",
-    "teams": "Microsoft Teams", "snmp": "SNMP traps",
+    "zendesk": "Zendesk", "servicenow": "ServiceNow", "pushover": "Pushover", "pagerduty": "PagerDuty",
+    "teams": "Microsoft Teams", "snmp": "SNMP traps", "webhook": "Webhook",
 }
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
@@ -82,7 +82,12 @@ def compute_range(range_key: str, from_date: str, to_date: str):
 
 
 def fetch_incidents(state: str, provider: str, search: str, start, end, limit: int = 200):
-    query = "SELECT * FROM incidents WHERE 1=1"
+    query = (
+        "SELECT incidents.*, (SELECT json_agg(json_build_object("
+        "'system', t.system, 'ref', t.ref, 'number', t.number) ORDER BY t.system) "
+        "FROM tickets t WHERE t.incident_id = incidents.id) AS other_tickets "
+        "FROM incidents WHERE 1=1"
+    )
     params: list = []
     if state != "all":
         query += " AND state = %s"
@@ -296,6 +301,24 @@ def _span(delta: timedelta) -> str:
     return f"{hours // 24}d"
 
 
+def _tickets(row) -> list[dict]:
+    """Each ticket an incident has, as {label, url}: Zendesk's number, then
+    ServiceNow's record."""
+    tickets = []
+    if row["ticket_id"]:
+        tickets.append({
+            "label": f"#{row['ticket_id']}",
+            "url": (f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{row['ticket_id']}"
+                    if ZENDESK_SUBDOMAIN else None)})
+    for t in row.get("other_tickets") or []:
+        if t["system"] == "servicenow":
+            tickets.append({
+                "label": t["number"] or t["ref"][:8],
+                "url": (f"{notifiers.SERVICENOW_URL}/{notifiers.SERVICENOW_TABLE}.do"
+                        f"?sys_id={t['ref']}" if notifiers.SERVICENOW_URL else None)})
+    return tickets
+
+
 def _incident_kind(row, now) -> str:
     if row["state"] == "resolved":
         return "resolved"
@@ -341,8 +364,7 @@ def index():
         row["kind"] = _incident_kind(row, now)
         row["duration"] = _duration(row["detected_at"], row["resolved_at"])
         row["provider_label"] = PROVIDER_LABELS.get(row["provider"], row["provider"])
-        row["ticket_url"] = (f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{row['ticket_id']}"
-                             if ZENDESK_SUBDOMAIN and row["ticket_id"] else None)
+        row["tickets"] = _tickets(row)
     bars, bar_errors = fetch_poll_bars()
 
     return render_template(

@@ -1,4 +1,6 @@
 """Run with: python -m unittest discover tests  (needs requirements.txt)."""
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -27,10 +29,10 @@ def row(event="opened", **extra):
             "payload": dict(NOTICE), **extra}
 
 
-def response(status):
+def response(status, body=b"{}"):
     resp = requests.Response()
     resp.status_code = status
-    resp._content = b"{}"
+    resp._content = body
     return resp
 
 
@@ -130,10 +132,186 @@ class Failures(unittest.TestCase):
         self.assertNotIn("SECRET", str(caught.exception))
 
 
+SN_CREATED = json.dumps({"result": {"sys_id": "a" * 32, "number": "INC0010042"}}).encode()
+
+
+class ServiceNow(unittest.TestCase):
+    def setUp(self):
+        patches = {"SERVICENOW_URL": "https://example.service-now.com",
+                   "SERVICENOW_USER": "skyfarer", "SERVICENOW_PASSWORD": "pw"}
+        for name, value in patches.items():
+            p = mock.patch.object(notifiers, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_record_shape(self):
+        record = notifiers.servicenow_record(row())
+        self.assertLessEqual(len(record["short_description"]), 160)
+        self.assertEqual(record["correlation_id"], "skyfarer-7")
+        self.assertEqual((record["impact"], record["urgency"]), ("2", "2"))
+        self.assertIn("Region: eu-west-2", record["description"])
+        for unset in ("assignment_group", "caller_id", "category"):
+            self.assertNotIn(unset, record)
+
+    def test_optional_and_extra_fields(self):
+        with mock.patch.object(notifiers, "SERVICENOW_ASSIGNMENT_GROUP", "Cloud Ops"), \
+                mock.patch.object(notifiers, "SERVICENOW_EXTRA_FIELDS_RAW",
+                                  '{"u_service": "Hosting", "impact": "1"}'):
+            record = notifiers.servicenow_record(row())
+        self.assertEqual(record["assignment_group"], "Cloud Ops")
+        self.assertEqual((record["u_service"], record["impact"]), ("Hosting", "1"))
+
+    def test_resolve_sets_state_and_close_fields(self):
+        payload = notifiers.servicenow_resolve(row("resolved"))
+        self.assertEqual((payload["state"], payload["close_code"]), ("6", "Resolved by caller"))
+        self.assertTrue(payload["close_notes"])
+        with mock.patch.object(notifiers, "SERVICENOW_RESOLVE", False):
+            self.assertEqual(set(notifiers.servicenow_resolve(row("resolved"))), {"work_notes"})
+
+    def test_create_returns_the_record(self):
+        with mock.patch.object(notifiers, "_request",
+                               return_value=response(201, SN_CREATED)) as req:
+            result = notifiers.send_servicenow(row())
+        self.assertEqual(result, {"ref": "a" * 32, "number": "INC0010042"})
+        method, url = req.call_args.args
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, "https://example.service-now.com/api/now/table/incident"
+                              "?sysparm_fields=sys_id,number")
+        self.assertEqual(req.call_args.kwargs["auth"], ("skyfarer", "pw"))
+
+    def test_updates_patch_the_record(self):
+        with mock.patch.object(notifiers, "_request", return_value=response(200)) as req:
+            notifiers.send_servicenow(row("updated", ticket_ref="b" * 32))
+        method, url = req.call_args.args
+        self.assertEqual((method, url.rsplit("/", 1)[1]), ("PATCH", "b" * 32))
+        self.assertIn("work_notes", req.call_args.kwargs["json"])
+
+    def test_token_replaces_basic_auth(self):
+        with mock.patch.object(notifiers, "SERVICENOW_TOKEN", "tok"):
+            auth = notifiers._sn_auth()
+        self.assertNotIn("auth", auth)
+        self.assertEqual(auth["headers"]["Authorization"], "Bearer tok")
+
+    def test_update_without_a_record_fails_for_good(self):
+        with self.assertRaises(notifiers.PermanentFailure):
+            notifiers.send_servicenow(row("resolved", ticket_ref=None))
+
+    def test_auth_failure_keeps_it_queued(self):
+        with mock.patch.object(notifiers, "_request", return_value=response(401)):
+            with self.assertRaises(notifiers.RetryLater):
+                notifiers.send_servicenow(row())
+
+    def test_bad_request_is_permanent(self):
+        with mock.patch.object(notifiers, "_request", return_value=response(400)):
+            with self.assertRaises(notifiers.PermanentFailure):
+                notifiers.send_servicenow(row())
+
+    def test_enabled_with_a_user_or_a_token(self):
+        self.assertIn("servicenow", notifiers.enabled_channels())
+        with mock.patch.object(notifiers, "SERVICENOW_PASSWORD", ""):
+            self.assertNotIn("servicenow", notifiers.enabled_channels())
+            with mock.patch.object(notifiers, "SERVICENOW_TOKEN", "tok"):
+                self.assertIn("servicenow", notifiers.enabled_channels())
+
+    def test_config_errors(self):
+        self.assertEqual(notifiers.config_errors(), [])
+        for name, value in (("SERVICENOW_PASSWORD", ""), ("SERVICENOW_IMPACT", "4"),
+                            ("SERVICENOW_EXTRA_FIELDS_RAW", "[1, 2]"),
+                            ("SERVICENOW_EXTRA_FIELDS_RAW", "{oops")):
+            with mock.patch.object(notifiers, name, value):
+                self.assertTrue(notifiers.config_errors(), (name, value))
+
+    def test_instance_name_or_url(self):
+        self.assertEqual(notifiers.servicenow_url("acme"), "https://acme.service-now.com")
+        self.assertEqual(notifiers.servicenow_url(" https://acme.example.com/ "),
+                         "https://acme.example.com")
+        self.assertEqual(notifiers.servicenow_url(""), "")
+
+
+class Webhook(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(notifiers, "WEBHOOK_URL", "https://hooks.example.test/in")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def send(self, r, **settings):
+        patches = [mock.patch.object(notifiers, k, v) for k, v in settings.items()]
+        for p in patches:
+            p.start()
+        try:
+            with mock.patch.object(notifiers, "_request", return_value=response(200)) as req:
+                notifiers.send_webhook(r)
+        finally:
+            for p in patches:
+                p.stop()
+        return req.call_args
+
+    def test_default_body_has_every_field(self):
+        call = self.send(row("resolved"))
+        body = json.loads(call.kwargs["data"])
+        self.assertEqual(body["source"], "skyfarer")
+        self.assertEqual((body["event"], body["incident_id"]), ("resolved", 7))
+        self.assertEqual(set(notifiers.WEBHOOK_FIELDS) - set(body), set())
+        self.assertEqual(call.args, ("POST", "https://hooks.example.test/in"))
+        headers = call.kwargs["headers"]
+        self.assertEqual((headers["X-Skyfarer-Event"], headers["X-Skyfarer-Incident"]),
+                         ("resolved", "7"))
+        self.assertNotIn("X-Skyfarer-Signature", headers)
+
+    def test_template_values_are_escaped_for_json(self):
+        r = row()
+        r["payload"]["title"] = 'Say "hi"\nnext line'
+        template = '{"text": "{{event}}: {{title}}", "id": {{incident_id}}}'
+        body = json.loads(self.send(r, WEBHOOK_TEMPLATE=template).kwargs["data"])
+        self.assertEqual(body, {"text": 'opened: Say "hi"\nnext line', "id": 7})
+
+    def test_plain_text_template(self):
+        call = self.send(row(), WEBHOOK_TEMPLATE="{{ provider }} {{region}}: {{title}}",
+                         WEBHOOK_CONTENT_TYPE="text/plain")
+        self.assertEqual(call.kwargs["data"], b"AWS eu-west-2: Service impact")
+        self.assertEqual(call.kwargs["headers"]["Content-Type"], "text/plain")
+
+    def test_signature_and_headers(self):
+        call = self.send(row(), WEBHOOK_SECRET="s3cret",
+                         WEBHOOK_HEADERS_RAW='{"Authorization": "Bearer abc"}')
+        headers, body = call.kwargs["headers"], call.kwargs["data"]
+        expected = hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
+        self.assertEqual(headers["X-Skyfarer-Signature"], f"sha256={expected}")
+        self.assertEqual(headers["Authorization"], "Bearer abc")
+
+    def test_retries_like_the_others(self):
+        for status, error in ((503, notifiers.RetryLater), (429, notifiers.RetryLater),
+                              (404, notifiers.PermanentFailure)):
+            with mock.patch.object(notifiers, "_request", return_value=response(status)):
+                with self.assertRaises(error):
+                    notifiers.send_webhook(row())
+
+    def test_config_errors(self):
+        self.assertEqual(notifiers.config_errors(), [])
+        for name, value in (("WEBHOOK_URL", "ftp://x"), ("WEBHOOK_METHOD", "GET"),
+                            ("WEBHOOK_HEADERS_RAW", '{"X": 1}'),
+                            ("WEBHOOK_TEMPLATE", '{"t": "{{titel}}"}'),
+                            ("WEBHOOK_TEMPLATE", '{"t": {{title}}}'),
+                            ("WEBHOOK_EVENTS", ["started"])):
+            with mock.patch.object(notifiers, name, value):
+                self.assertTrue(notifiers.config_errors(), (name, value))
+
+    def test_own_event_list(self):
+        def queued(event, events):
+            with mock.patch.object(notifiers, "enabled_channels", return_value=["webhook", "teams"]), \
+                    mock.patch.object(notifiers, "WEBHOOK_EVENTS", events), \
+                    mock.patch.object(notifiers.db, "was_notified", return_value=True), \
+                    mock.patch.object(notifiers.db, "add_notification") as add:
+                notifiers.enqueue(None, 7, event, dict(NOTICE))
+            return {c.kwargs["channel"] for c in add.call_args_list}
+        self.assertEqual(queued("updated", ["opened", "updated", "resolved"]), {"webhook"})
+        self.assertEqual(queued("opened", ["resolved"]), {"teams"})
+
+
 class Enqueue(unittest.TestCase):
     def queued(self, event, *, alert=True, notified=True, events=("opened", "resolved")):
         with mock.patch.object(notifiers, "enabled_channels", return_value=[
-                "zendesk", "pushover", "pagerduty", "teams", "snmp"]), \
+                "zendesk", "servicenow", "pushover", "pagerduty", "teams", "snmp"]), \
                 mock.patch.object(notifiers, "NOTIFY_EVENTS", list(events)), \
                 mock.patch.object(notifiers.db, "was_notified", return_value=notified), \
                 mock.patch.object(notifiers.db, "add_notification") as add:
@@ -142,20 +320,20 @@ class Enqueue(unittest.TestCase):
 
     def test_opened_reaches_everyone(self):
         self.assertEqual(self.queued("opened"),
-                         {"zendesk", "pushover", "pagerduty", "teams", "snmp"})
+                         {"zendesk", "servicenow", "pushover", "pagerduty", "teams", "snmp"})
 
-    def test_suppressed_incident_only_reaches_zendesk(self):
-        self.assertEqual(self.queued("opened", alert=False), {"zendesk"})
+    def test_suppressed_incident_only_reaches_ticketing(self):
+        self.assertEqual(self.queued("opened", alert=False), {"zendesk", "servicenow"})
 
     def test_no_all_clear_without_an_alert(self):
-        self.assertEqual(self.queued("resolved", notified=False), {"zendesk"})
+        self.assertEqual(self.queued("resolved", notified=False), {"zendesk", "servicenow"})
 
-    def test_updates_are_zendesk_only_by_default(self):
-        self.assertEqual(self.queued("updated"), {"zendesk"})
+    def test_updates_are_ticketing_only_by_default(self):
+        self.assertEqual(self.queued("updated"), {"zendesk", "servicenow"})
 
     def test_pagerduty_never_gets_updates(self):
         got = self.queued("updated", events=notifiers.EVENTS)
-        self.assertEqual(got, {"zendesk", "pushover", "teams", "snmp"})
+        self.assertEqual(got, {"zendesk", "servicenow", "pushover", "teams", "snmp"})
 
 
 class Delivery(unittest.TestCase):
@@ -167,14 +345,17 @@ class Delivery(unittest.TestCase):
         return {**base, **extra}
 
     def deliver(self, rows, sender):
-        with mock.patch.object(notifiers, "enabled_channels", return_value=["zendesk", "teams"]), \
-                mock.patch.dict(notifiers.SENDERS, {"zendesk": sender, "teams": sender}), \
+        with mock.patch.object(notifiers, "enabled_channels",
+                               return_value=["zendesk", "servicenow", "teams"]), \
+                mock.patch.dict(notifiers.SENDERS, {"zendesk": sender, "servicenow": sender,
+                                                    "teams": sender}), \
                 mock.patch.object(notifiers.db, "get_conn"), \
                 mock.patch.object(notifiers.db, "pending_notifications", return_value=rows), \
                 mock.patch.object(notifiers.db, "notification_sent"), \
                 mock.patch.object(notifiers.db, "notification_retry") as retry, \
                 mock.patch.object(notifiers.db, "notification_failed") as failed, \
-                mock.patch.object(notifiers.db, "set_ticket"):
+                mock.patch.object(notifiers.db, "set_ticket"), \
+                mock.patch.object(notifiers.db, "set_external_ticket") as self.stored:
             return notifiers.deliver_pending(), retry, failed
 
     def test_first_update_can_use_a_ticket_opened_in_the_same_pass(self):
@@ -188,6 +369,19 @@ class Delivery(unittest.TestCase):
         sent, _, failed = self.deliver(rows, sender)
         self.assertEqual((sent, seen), (2, [None, 99]))
         failed.assert_not_called()
+
+    def test_servicenow_update_can_use_a_record_opened_in_the_same_pass(self):
+        seen = []
+
+        def sender(r):
+            seen.append(r.get("ticket_ref"))
+            return {"ref": "c" * 32, "number": "INC1"} if r["event"] == "opened" else None
+
+        rows = [self.queued(1, "opened", channel="servicenow"),
+                self.queued(2, "resolved", channel="servicenow")]
+        sent, _, _ = self.deliver(rows, sender)
+        self.assertEqual((sent, seen), (2, [None, "c" * 32]))
+        self.stored.assert_called_once_with(mock.ANY, 7, "servicenow", ref="c" * 32, number="INC1")
 
     def test_a_retry_holds_back_later_notices_for_that_incident_and_channel(self):
         calls = []

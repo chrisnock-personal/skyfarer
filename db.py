@@ -83,7 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_incident_updates_incident ON incident_updates (in
 CREATE TABLE IF NOT EXISTS notifications (
     id              SERIAL PRIMARY KEY,
     incident_id     INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
-    channel         TEXT NOT NULL,             -- zendesk | pushover | pagerduty | teams | snmp
+    channel         TEXT NOT NULL,             -- zendesk | servicenow | pushover | pagerduty | teams | snmp | webhook
     event           TEXT NOT NULL,             -- opened | updated | resolved
     payload         JSONB NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | failed
@@ -105,6 +105,17 @@ CREATE TABLE IF NOT EXISTS poll_log (
     tickets_resolved INTEGER NOT NULL DEFAULT 0,
     open_count      INTEGER NOT NULL DEFAULT 0,
     error           TEXT
+);
+
+-- Records in ticketing systems other than Zendesk (whose ticket number is
+-- incidents.ticket_id): one per incident per system.
+CREATE TABLE IF NOT EXISTS tickets (
+    incident_id     INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
+    system          TEXT NOT NULL,             -- servicenow
+    ref             TEXT NOT NULL,             -- the system's own ID (ServiceNow sys_id)
+    number          TEXT,                      -- what people call it (INC0010001)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (incident_id, system)
 );
 
 -- Feeds that could not be read in a cycle, as "Provider: reason; ...".
@@ -260,8 +271,10 @@ def pending_notifications(conn) -> list[dict]:
     """Everything undelivered, oldest first, with the incident's ticket."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT n.*, i.ticket_id
+            SELECT n.*, i.ticket_id, t.ref AS ticket_ref
               FROM notifications n JOIN incidents i ON i.id = n.incident_id
+              LEFT JOIN tickets t ON t.incident_id = n.incident_id
+                                 AND t.system = n.channel
              WHERE n.status = 'pending'
              ORDER BY n.id
         """)
@@ -301,6 +314,17 @@ def set_ticket(conn, incident_id: int, ticket_id: int) -> None:
     with conn.cursor() as cur:
         cur.execute("UPDATE incidents SET ticket_id = %s WHERE id = %s",
                     (ticket_id, incident_id))
+
+
+def set_external_ticket(conn, incident_id: int, system: str, *, ref: str,
+                        number: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO tickets (incident_id, system, ref, number)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (incident_id, system) DO UPDATE
+               SET ref = EXCLUDED.ref, number = EXCLUDED.number
+        """, (incident_id, system, ref, number))
 
 
 def count_open(conn) -> int:

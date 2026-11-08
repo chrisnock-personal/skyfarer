@@ -1,8 +1,8 @@
 """
 notifiers.py
 ~~~~~~~~~~~~
-Sends incident notices to Zendesk, Pushover, PagerDuty, Microsoft Teams and
-SNMP trap receivers.
+Sends incident notices to Zendesk, ServiceNow, Pushover, PagerDuty, Microsoft
+Teams, SNMP trap receivers and an outbound webhook.
 
 Notices go through the `notifications` table, one row per channel. A poll cycle
 adds rows in the same transaction that records the incident, and they are sent
@@ -13,10 +13,15 @@ and retries alone, and one channel being down can't hold up the others.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
+import re
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -55,6 +60,29 @@ else:
             f"ZD_TICKET_GROUP_ID must be a valid integer, got: {_ZD_GROUP_ID_RAW!r}"
         )
 
+def servicenow_url(instance: str) -> str:
+    """SERVICENOW_INSTANCE is an instance name ("yourcompany") or its full URL."""
+    instance = instance.strip().rstrip("/")
+    if not instance or "://" in instance:
+        return instance
+    return f"https://{instance}.service-now.com"
+
+
+SERVICENOW_URL = servicenow_url(os.getenv("SERVICENOW_INSTANCE", ""))
+SERVICENOW_USER = os.getenv("SERVICENOW_USER", "")
+SERVICENOW_PASSWORD = os.getenv("SERVICENOW_PASSWORD", "")
+SERVICENOW_TOKEN = os.getenv("SERVICENOW_TOKEN", "")          # OAuth bearer, instead of a user
+SERVICENOW_TABLE = os.getenv("SERVICENOW_TABLE", "incident")
+SERVICENOW_IMPACT = os.getenv("SERVICENOW_IMPACT", "2")
+SERVICENOW_URGENCY = os.getenv("SERVICENOW_URGENCY", "2")
+SERVICENOW_ASSIGNMENT_GROUP = os.getenv("SERVICENOW_ASSIGNMENT_GROUP", "")
+SERVICENOW_CALLER = os.getenv("SERVICENOW_CALLER", "")
+SERVICENOW_CATEGORY = os.getenv("SERVICENOW_CATEGORY", "")
+SERVICENOW_RESOLVE = os.getenv("SERVICENOW_RESOLVE", "true").lower() in ("1", "true", "yes")
+SERVICENOW_RESOLVED_STATE = os.getenv("SERVICENOW_RESOLVED_STATE", "6")
+SERVICENOW_CLOSE_CODE = os.getenv("SERVICENOW_CLOSE_CODE", "Resolved by caller")
+SERVICENOW_EXTRA_FIELDS_RAW = os.getenv("SERVICENOW_EXTRA_FIELDS", "")
+
 PUSHOVER_API_URL = os.getenv("PUSHOVER_API_URL", "https://api.pushover.net/1/messages.json")
 PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.getenv("PUSHOVER_USER", "")
@@ -66,6 +94,15 @@ PAGERDUTY_SEVERITY = os.getenv("PAGERDUTY_SEVERITY", "error")
 PAGERDUTY_SEVERITIES = ("critical", "error", "warning", "info")
 
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
+
+# Outbound webhook: any URL, with an optional body template (see webhook_body).
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_METHOD = os.getenv("WEBHOOK_METHOD", "POST").upper()
+WEBHOOK_HEADERS_RAW = os.getenv("WEBHOOK_HEADERS", "")
+WEBHOOK_TEMPLATE = os.getenv("WEBHOOK_TEMPLATE", "")
+WEBHOOK_CONTENT_TYPE = os.getenv("WEBHOOK_CONTENT_TYPE", "application/json")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_EVENTS = _env_list("WEBHOOK_EVENTS") or NOTIFY_EVENTS
 
 SNMP_TRAP_TARGETS = _env_list("SNMP_TRAP_TARGETS")
 SNMP_COMMUNITY = os.getenv("SNMP_COMMUNITY", "")
@@ -189,6 +226,103 @@ def send_zendesk(row: dict) -> Optional[int]:
     return None
 
 
+# ─── ServiceNow ─────────────────────────────────────────────────────────────
+
+def _sn_extra_fields() -> dict:
+    """SERVICENOW_EXTRA_FIELDS: a JSON object of more fields to set on every
+    new record, such as {"u_service": "Cloud hosting"}. Checked at startup."""
+    if not SERVICENOW_EXTRA_FIELDS_RAW.strip():
+        return {}
+    value = json.loads(SERVICENOW_EXTRA_FIELDS_RAW)
+    if not isinstance(value, dict):
+        raise ValueError("not a JSON object")
+    return value
+
+
+def _sn_auth() -> dict:
+    if SERVICENOW_TOKEN:
+        return {"headers": {"Authorization": f"Bearer {SERVICENOW_TOKEN}",
+                            "Accept": "application/json"}}
+    return {"auth": (SERVICENOW_USER, SERVICENOW_PASSWORD),
+            "headers": {"Accept": "application/json"}}
+
+
+def _sn_url(sys_id: str = "") -> str:
+    path = f"{SERVICENOW_URL}/api/now/table/{SERVICENOW_TABLE}"
+    return f"{path}/{sys_id}" if sys_id else f"{path}?sysparm_fields=sys_id,number"
+
+
+def servicenow_record(row: dict) -> dict:
+    """A new record. ServiceNow work notes and descriptions are plain text."""
+    n = row["payload"]
+    description = (
+        f"Provider: {n['provider']}\n"
+        f"Region: {n['region']}\n"
+        f"Status page: {n['link']}\n\n"
+        f"Incident published: {n['published']}\n"
+        f"Last updated: {n['updated']}\n"
+        f"Detected by Skyfarer: {n['noticed']}\n\n"
+        f"{n['summary']}"
+    )
+    record = {
+        "short_description": _subject(row)[:160],
+        "description": description,
+        "impact": SERVICENOW_IMPACT,
+        "urgency": SERVICENOW_URGENCY,
+        # Ties the record to its Skyfarer incident for searches and dedup rules.
+        "correlation_id": f"skyfarer-{row['incident_id']}",
+        "correlation_display": "Skyfarer",
+    }
+    for field, value in (("assignment_group", SERVICENOW_ASSIGNMENT_GROUP),
+                         ("caller_id", SERVICENOW_CALLER),
+                         ("category", SERVICENOW_CATEGORY)):
+        if value:
+            record[field] = value
+    record.update(_sn_extra_fields())
+    return record
+
+
+def servicenow_note(row: dict) -> dict:
+    n = row["payload"]
+    count = n.get("update_count", 1)
+    heading = (f"{count} new updates from {n['provider']}" if count > 1
+               else f"New update from {n['provider']}")
+    return {"work_notes": (f"{heading} (published {n['published']})\n"
+                           f"{n['link']}\n\n{n['title']}\n\n{n['summary']}")}
+
+
+def servicenow_resolve(row: dict) -> dict:
+    n = row["payload"]
+    notes = (f"{n['provider']} reports this incident resolved "
+             f"(feed updated {n['updated']}, detected {n['noticed']}).\n"
+             f"{n['link']}\n\n{n['summary']}")
+    if not SERVICENOW_RESOLVE:
+        return {"work_notes": notes + "\n\nLeft open for manual review and closure."}
+    return {"state": SERVICENOW_RESOLVED_STATE, "close_code": SERVICENOW_CLOSE_CODE,
+            "close_notes": notes, "work_notes": notes}
+
+
+def send_servicenow(row: dict) -> Optional[dict]:
+    """Returns {"ref": sys_id, "number": "INC..."} when a record is created."""
+    # As with Zendesk, an expired password or token gets fixed: keep the
+    # notices queued until it is.
+    retry = (401, 403, 429)
+    if row["event"] == "opened":
+        resp = _request("POST", _sn_url(), json=servicenow_record(row), **_sn_auth())
+        _check(resp, retry=retry)
+        result = resp.json().get("result") or {}
+        if not result.get("sys_id"):
+            raise PermanentFailure("no sys_id in the response")
+        return {"ref": result["sys_id"], "number": result.get("number") or ""}
+
+    if not row.get("ticket_ref"):
+        raise PermanentFailure("incident has no ServiceNow record")
+    payload = servicenow_resolve(row) if row["event"] == "resolved" else servicenow_note(row)
+    resp = _request("PATCH", _sn_url(row["ticket_ref"]), json=payload, **_sn_auth())
+    _check(resp, retry=retry)
+    return None
+
+
 # ─── Pushover ───────────────────────────────────────────────────────────────
 
 def pushover_message(row: dict) -> dict:
@@ -288,6 +422,81 @@ def send_teams(row: dict) -> None:
     _check(_request("POST", TEAMS_WEBHOOK_URL, json=teams_card(row)))
 
 
+# ─── Webhook ────────────────────────────────────────────────────────────────
+
+WEBHOOK_FIELDS = ("event", "incident_id", "provider", "region", "title", "summary",
+                  "link", "published", "updated", "noticed", "update_count")
+_PLACEHOLDER = re.compile(r"\{\{\s*([a-z_]+)\s*\}\}")
+
+
+def webhook_values(row: dict) -> dict:
+    n = row["payload"]
+    values = {field: n.get(field, "") for field in WEBHOOK_FIELDS}
+    values.update(event=row["event"], incident_id=row["incident_id"],
+                  update_count=n.get("update_count", 0))
+    return values
+
+
+def _webhook_headers() -> dict:
+    """WEBHOOK_HEADERS: a JSON object of extra headers, such as an API key.
+    Checked at startup."""
+    if not WEBHOOK_HEADERS_RAW.strip():
+        return {}
+    value = json.loads(WEBHOOK_HEADERS_RAW)
+    if not isinstance(value, dict) or not all(isinstance(v, str) for v in value.values()):
+        raise ValueError("not a JSON object of strings")
+    return value
+
+
+def webhook_body(row: dict) -> str:
+    """The request body. Without WEBHOOK_TEMPLATE, a JSON document with every
+    field. With one, each {{field}} in the template is replaced by its value:
+    escaped for use inside a JSON string when the content type is JSON (so
+    write "{{title}}" with the quotes), as plain text otherwise."""
+    values = webhook_values(row)
+    if not WEBHOOK_TEMPLATE:
+        return json.dumps({"source": "skyfarer", **values})
+    is_json = "json" in WEBHOOK_CONTENT_TYPE
+
+    def fill(match: re.Match) -> str:
+        value = values[match.group(1)]
+        if isinstance(value, int) or not is_json:
+            return str(value)
+        return json.dumps(str(value))[1:-1]
+    return _PLACEHOLDER.sub(fill, WEBHOOK_TEMPLATE)
+
+
+def _webhook_template_errors() -> list[str]:
+    errors = []
+    unknown = sorted({m.group(1) for m in _PLACEHOLDER.finditer(WEBHOOK_TEMPLATE)}
+                     - set(WEBHOOK_FIELDS))
+    if unknown:
+        errors.append(f"WEBHOOK_TEMPLATE has unknown placeholders: {', '.join(unknown)} "
+                      f"(known: {', '.join(WEBHOOK_FIELDS)})")
+    elif WEBHOOK_TEMPLATE and "json" in WEBHOOK_CONTENT_TYPE:
+        sample = {"id": 1, "incident_id": 1, "event": "opened", "payload": {
+            "provider": "AWS", "region": "eu-west-2", "title": 'A "quoted" title',
+            "summary": "Line one\nline two", "link": "https://example.com/",
+            "published": "", "updated": "", "noticed": ""}}
+        try:
+            json.loads(webhook_body(sample))
+        except ValueError as exc:
+            errors.append(f"WEBHOOK_TEMPLATE doesn't make valid JSON: {exc}")
+    return errors
+
+
+def send_webhook(row: dict) -> None:
+    body = webhook_body(row).encode()
+    headers = {"Content-Type": WEBHOOK_CONTENT_TYPE, "User-Agent": "skyfarer",
+               "X-Skyfarer-Event": row["event"],
+               "X-Skyfarer-Incident": str(row["incident_id"]), **_webhook_headers()}
+    if WEBHOOK_SECRET:
+        # The receiver recomputes this over the raw body to check the sender.
+        digest = hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        headers["X-Skyfarer-Signature"] = f"sha256={digest}"
+    _check(_request(WEBHOOK_METHOD, WEBHOOK_URL, data=body, headers=headers))
+
+
 # ─── SNMP traps ─────────────────────────────────────────────────────────────
 
 def _snmp_target(target: str) -> tuple[str, int]:
@@ -342,13 +551,19 @@ def send_snmp(row: dict) -> None:
 
 # ─── Channels ───────────────────────────────────────────────────────────────
 
-SENDERS: dict[str, Callable[[dict], Optional[int]]] = {
+SENDERS: dict[str, Callable[[dict], object]] = {
     "zendesk": send_zendesk,
+    "servicenow": send_servicenow,
     "pushover": send_pushover,
     "pagerduty": send_pagerduty,
     "teams": send_teams,
     "snmp": send_snmp,
+    "webhook": send_webhook,
 }
+
+# Ticketing systems keep a record of every incident, old ones and maintenance
+# included, and get every event; the others are alert channels.
+TICKET_CHANNELS = ("zendesk", "servicenow")
 
 # PagerDuty alerts have no "update" action: an event would just re-trigger.
 CHANNEL_EVENTS = {
@@ -356,6 +571,7 @@ CHANNEL_EVENTS = {
     "pagerduty": ("opened", "resolved"),
     "teams": EVENTS,
     "snmp": EVENTS,
+    "webhook": EVENTS,
 }
 
 
@@ -363,6 +579,8 @@ def enabled_channels() -> list[str]:
     channels = []
     if ZENDESK_SUBDOMAIN and ZENDESK_EMAIL and ZENDESK_API_TOKEN:
         channels.append("zendesk")
+    if SERVICENOW_URL and (SERVICENOW_TOKEN or (SERVICENOW_USER and SERVICENOW_PASSWORD)):
+        channels.append("servicenow")
     if PUSHOVER_TOKEN and PUSHOVER_USER:
         channels.append("pushover")
     if PAGERDUTY_ROUTING_KEY:
@@ -371,6 +589,8 @@ def enabled_channels() -> list[str]:
         channels.append("teams")
     if SNMP_TRAP_TARGETS:
         channels.append("snmp")
+    if WEBHOOK_URL:
+        channels.append("webhook")
     return channels
 
 
@@ -380,6 +600,19 @@ def config_errors() -> list[str]:
     if any((ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN)) and not all(
             (ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN)):
         errors.append("Zendesk needs ZENDESK_SUBDOMAIN, ZENDESK_EMAIL and ZENDESK_API_TOKEN")
+    sn_auth = SERVICENOW_TOKEN or (SERVICENOW_USER and SERVICENOW_PASSWORD)
+    if (SERVICENOW_URL or SERVICENOW_USER or SERVICENOW_PASSWORD or SERVICENOW_TOKEN) and not (
+            SERVICENOW_URL and sn_auth):
+        errors.append("ServiceNow needs SERVICENOW_INSTANCE and either SERVICENOW_USER "
+                      "with SERVICENOW_PASSWORD, or SERVICENOW_TOKEN")
+    for name, value in (("SERVICENOW_IMPACT", SERVICENOW_IMPACT),
+                        ("SERVICENOW_URGENCY", SERVICENOW_URGENCY)):
+        if value not in ("1", "2", "3"):
+            errors.append(f"{name} must be 1, 2 or 3, got: {value!r}")
+    try:
+        _sn_extra_fields()
+    except ValueError as exc:
+        errors.append(f"SERVICENOW_EXTRA_FIELDS must be a JSON object: {exc}")
     if bool(PUSHOVER_TOKEN) != bool(PUSHOVER_USER):
         errors.append("Pushover needs both PUSHOVER_TOKEN and PUSHOVER_USER")
     if PUSHOVER_PRIORITY not in ("-2", "-1", "0", "1", "2"):
@@ -394,9 +627,20 @@ def config_errors() -> list[str]:
             _snmp_target(target)
         except ValueError:
             errors.append(f"SNMP_TRAP_TARGETS has a bad port: {target!r}")
-    unknown = [e for e in NOTIFY_EVENTS if e not in EVENTS]
-    if unknown:
-        errors.append(f"NOTIFY_EVENTS must be from {', '.join(EVENTS)}, got: {', '.join(unknown)}")
+    for name, events in (("NOTIFY_EVENTS", NOTIFY_EVENTS), ("WEBHOOK_EVENTS", WEBHOOK_EVENTS)):
+        unknown = [e for e in events if e not in EVENTS]
+        if unknown:
+            errors.append(f"{name} must be from {', '.join(EVENTS)}, got: {', '.join(unknown)}")
+    if WEBHOOK_URL:
+        if urlsplit(WEBHOOK_URL).scheme not in ("http", "https"):
+            errors.append("WEBHOOK_URL must be an http or https URL")
+        if WEBHOOK_METHOD not in ("POST", "PUT", "PATCH"):
+            errors.append(f"WEBHOOK_METHOD must be POST, PUT or PATCH, got: {WEBHOOK_METHOD!r}")
+        try:
+            _webhook_headers()
+        except ValueError as exc:
+            errors.append(f"WEBHOOK_HEADERS must be a JSON object of strings: {exc}")
+        errors += _webhook_template_errors()
     return errors
 
 
@@ -404,12 +648,13 @@ def config_errors() -> list[str]:
 
 def enqueue(conn, incident_id: int, event: str, payload: dict, *, alert: bool = True) -> None:
     """Queue a notice for each channel that should get it. `alert` False keeps
-    an incident away from the channels that interrupt people; Zendesk records
-    everything. Those channels only hear how an incident ends if they heard it
-    begin, so a suppressed incident stays silent throughout."""
+    an incident away from the channels that interrupt people; the ticketing
+    systems record everything. Those channels only hear how an incident ends
+    if they heard it begin, so a suppressed incident stays silent throughout."""
     for channel in enabled_channels():
-        if channel != "zendesk":
-            if event not in NOTIFY_EVENTS or event not in CHANNEL_EVENTS[channel]:
+        if channel not in TICKET_CHANNELS:
+            wanted = WEBHOOK_EVENTS if channel == "webhook" else NOTIFY_EVENTS
+            if event not in wanted or event not in CHANNEL_EVENTS[channel]:
                 continue
             if event == "opened":
                 if not alert:
@@ -429,7 +674,8 @@ def deliver_pending() -> int:
 
     sent = 0
     held: set[tuple[int, str]] = set()  # keeps each incident's notices in order
-    new_tickets: dict[int, int] = {}    # created during this pass
+    new_tickets: dict[int, int] = {}    # Zendesk tickets created during this pass
+    new_refs: dict[tuple[int, str], str] = {}  # other ticketing systems' records
     for row in rows:
         key = (row["incident_id"], row["channel"])
         if key in held:
@@ -441,6 +687,7 @@ def deliver_pending() -> int:
         # `rows` was read before this pass, so a ticket opened a moment ago
         # isn't in it, and the same pass can hold that ticket's first update.
         row["ticket_id"] = row["ticket_id"] or new_tickets.get(row["incident_id"])
+        row["ticket_ref"] = row.get("ticket_ref") or new_refs.get(key)
 
         sender = SENDERS[row["channel"]] if row["channel"] in enabled_channels() else None
         try:
@@ -472,4 +719,8 @@ def deliver_pending() -> int:
                 if row["channel"] == "zendesk" and result:
                     db.set_ticket(conn, row["incident_id"], result)
                     new_tickets[row["incident_id"]] = result
+                elif row["channel"] in TICKET_CHANNELS and result:
+                    db.set_external_ticket(conn, row["incident_id"], row["channel"],
+                                           ref=result["ref"], number=result["number"])
+                    new_refs[key] = result["ref"]
     return sent

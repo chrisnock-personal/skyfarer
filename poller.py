@@ -5,9 +5,10 @@ poller.py
 Skyfarer's poller. Reads the public status feeds of AWS, Azure, Google Cloud,
 OVHcloud, DigitalOcean, Hetzner, Linode, Cloudflare and Scaleway (see
 feeds.py) and sends a notice whenever an entry touches a region you watch:
-Zendesk tickets, plus Pushover, PagerDuty, Microsoft Teams and SNMP traps (see
-notifiers.py). When the provider marks the incident over, the ticket gets a
-comment and moves to "pending" for manual closure.
+Zendesk tickets or ServiceNow incidents, plus Pushover, PagerDuty, Microsoft
+Teams and SNMP traps (see notifiers.py). When the provider marks the incident
+over, the Zendesk ticket gets a comment and moves to "pending" for manual
+closure, and the ServiceNow record is resolved.
 
 All incident state is held in Postgres -no local files.
 
@@ -62,7 +63,7 @@ def preflight(dry_run: bool = False) -> bool:
         log.error(error); ok = False
     if not dry_run and not notifiers.enabled_channels():
         log.error("No notification channel configured: set up at least one of "
-                  "Zendesk, Pushover, PagerDuty, Teams or SNMP traps"); ok = False
+                  "Zendesk, ServiceNow, Pushover, PagerDuty, Teams, SNMP traps or a webhook"); ok = False
     if not any(feeds.watched_regions().values()):
         log.error("No regions configured: set at least one of %s",
                   ", ".join(_region_settings())); ok = False
