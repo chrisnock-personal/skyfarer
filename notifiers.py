@@ -355,9 +355,8 @@ def send_pushover(row: dict) -> None:
 
 def pagerduty_event(row: dict) -> dict:
     n = row["payload"]
-    # Kept from before the rename to Skyfarer: a resolve must carry the same key
-    # as its trigger, and alerts raised before the rename may still be open.
-    dedup_key = f"cloud-status-{row['incident_id']}"
+    # A resolve must carry the same key as its trigger.
+    dedup_key = f"skyfarer-{row['incident_id']}"
     if row["event"] == "resolved":
         return {"routing_key": PAGERDUTY_ROUTING_KEY, "event_action": "resolve",
                 "dedup_key": dedup_key}
@@ -373,7 +372,7 @@ def pagerduty_event(row: dict) -> dict:
             "severity": PAGERDUTY_SEVERITY,
             "component": n["region"],
             "group": n["provider"],
-            "class": "cloud-status",
+            "class": "provider-incident",
             "custom_details": {"published": n["published"], "detail": n["summary"]},
         },
     }

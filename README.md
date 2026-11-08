@@ -15,8 +15,6 @@ incident clear.
 
 All incident state is held in **Postgres** -no local JSON files.  The whole stack runs in Docker Compose.
 
-Skyfarer was called Cloud Status Poller until November 2026. See
-[Upgrading from Cloud Status Poller](#upgrading-from-cloud-status-poller).
 
 ## Quick start
 
@@ -414,26 +412,6 @@ Covers each channel's payload against its published limits, which failures
 retry, what gets queued for which channel, delivery order, and startup checks,
 plus region matching and parsing for the Statuspage and Hetzner feeds (from
 trimmed copies of real payloads). They need no database or network.
-
-## Upgrading from Cloud Status Poller
-
-The code now lives in `poller.py` (was `status_poller.py`) and `feeds.py`,
-and the defaults changed to the new name. An existing install keeps working
-if you:
-
-- Add `PGDATA_VOLUME=cloud-status-poller_pgdata` to `.env`, so Compose (whose
-  project is now called `skyfarer`) uses the volume your data is in, and keep
-  `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB` at the values it was
-  created with (`poller` / `poller` / `status_poller` by default). The schema
-  gains two columns on the next start, with no other change.
-- Keep `ZD_TICKET_TAGS` as it is if Zendesk views or triggers use the
-  `cloud-status` tag; the new default is `skyfarer,auto-raised`.
-- Load `SKYFARER-MIB.txt` on trap receivers in place of
-  `CLOUD-STATUS-POLLER-MIB.txt`. The OIDs are unchanged; only the names are
-  (`cspProvider` is now `sfProvider`, and so on).
-
-PagerDuty dedup keys keep their `cloud-status-` prefix, so alerts raised
-before the upgrade still resolve.
 
 ## .env reference
 

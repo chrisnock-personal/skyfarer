@@ -45,6 +45,5 @@ services:
 
 volumes:
   pgdata:
-    # An install from before the rename keeps its data in
-    # cloud-status-poller_pgdata: set PGDATA_VOLUME to that in .env.
+    # Set PGDATA_VOLUME in .env to keep the data in a different volume.
     name: ${PGDATA_VOLUME:-skyfarer_pgdata}

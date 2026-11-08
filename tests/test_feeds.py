@@ -1,4 +1,4 @@
-"""Feed parsing for the providers added with the rename to Skyfarer, and the
+"""Feed parsing for the Statuspage and Hetzner providers, and the
 region matching they share. Fixtures are trimmed from real payloads (November
 2026). Run with: python -m unittest discover tests"""
 import os
