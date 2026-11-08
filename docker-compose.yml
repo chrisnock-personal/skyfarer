@@ -1,0 +1,50 @@
+name: skyfarer
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-skyfarer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skyfarer}
+      POSTGRES_DB: ${POSTGRES_DB:-skyfarer}
+    volumes:
+      - pgdata:/var/lib/postgresql/data:Z
+    ports:
+      - "${POSTGRES_EXPOSE:-127.0.0.1:5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-skyfarer}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  poller:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Override host to point at the compose service name
+      POSTGRES_HOST: db
+
+  dashboard:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["python", "-u", "dashboard.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      POSTGRES_HOST: db
+    ports:
+      - "${DASHBOARD_EXPOSE:-127.0.0.1:8080}:8080"
+
+volumes:
+  pgdata:
+    # An install from before the rename keeps its data in
+    # cloud-status-poller_pgdata: set PGDATA_VOLUME to that in .env.
+    name: ${PGDATA_VOLUME:-skyfarer_pgdata}

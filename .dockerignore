@@ -1,0 +1,6 @@
+.env
+.env.example
+*.md
+*.json
+__pycache__
+.git

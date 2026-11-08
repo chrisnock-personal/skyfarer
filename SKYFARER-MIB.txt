@@ -1,0 +1,82 @@
+SKYFARER-MIB DEFINITIONS ::= BEGIN
+
+-- Traps sent by Skyfarer (formerly Cloud Status Poller). These sit under the experimental arc
+-- until you assign your own enterprise number; if you change SNMP_BASE_OID,
+-- change the OID below to match.
+
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, NOTIFICATION-TYPE, Integer32, experimental
+        FROM SNMPv2-SMI
+    DisplayString
+        FROM SNMPv2-TC;
+
+skyfarer MODULE-IDENTITY
+    LAST-UPDATED "202611080000Z"
+    ORGANIZATION "Skyfarer"
+    CONTACT-INFO "See the project README."
+    DESCRIPTION  "Notifications about incidents on cloud provider status pages."
+    REVISION     "202611080000Z"
+    DESCRIPTION  "Renamed from CLOUD-STATUS-POLLER-MIB. OIDs unchanged; more
+                  providers can appear in sfProvider."
+    REVISION     "202611040000Z"
+    DESCRIPTION  "First version."
+    ::= { experimental 77701 }
+
+sfNotifications OBJECT IDENTIFIER ::= { skyfarer 0 }
+sfObjects       OBJECT IDENTIFIER ::= { skyfarer 1 }
+
+sfProvider OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  accessible-for-notify
+    STATUS      current
+    DESCRIPTION "The cloud provider: AWS, Azure, GCP, OVH, DigitalOcean,
+                 Hetzner, Linode, Cloudflare or Scaleway."
+    ::= { sfObjects 1 }
+
+sfRegion OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  accessible-for-notify
+    STATUS      current
+    DESCRIPTION "The watched region or regions affected."
+    ::= { sfObjects 2 }
+
+sfTitle OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  accessible-for-notify
+    STATUS      current
+    DESCRIPTION "The incident's title, up to 255 characters."
+    ::= { sfObjects 3 }
+
+sfLink OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  accessible-for-notify
+    STATUS      current
+    DESCRIPTION "The provider's status page for the incident."
+    ::= { sfObjects 4 }
+
+sfIncidentId OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  accessible-for-notify
+    STATUS      current
+    DESCRIPTION "Stable across one incident's traps, for correlating them."
+    ::= { sfObjects 5 }
+
+sfIncidentOpened NOTIFICATION-TYPE
+    OBJECTS     { sfProvider, sfRegion, sfTitle, sfLink, sfIncidentId }
+    STATUS      current
+    DESCRIPTION "A new incident in a watched region."
+    ::= { sfNotifications 1 }
+
+sfIncidentUpdated NOTIFICATION-TYPE
+    OBJECTS     { sfProvider, sfRegion, sfTitle, sfLink, sfIncidentId }
+    STATUS      current
+    DESCRIPTION "The provider posted an update on an open incident."
+    ::= { sfNotifications 2 }
+
+sfIncidentResolved NOTIFICATION-TYPE
+    OBJECTS     { sfProvider, sfRegion, sfTitle, sfLink, sfIncidentId }
+    STATUS      current
+    DESCRIPTION "The provider says the incident is over."
+    ::= { sfNotifications 3 }
+
+END

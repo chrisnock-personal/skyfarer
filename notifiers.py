@@ -1,0 +1,475 @@
+"""
+notifiers.py
+~~~~~~~~~~~~
+Sends incident notices to Zendesk, Pushover, PagerDuty, Microsoft Teams and
+SNMP trap receivers.
+
+Notices go through the `notifications` table, one row per channel. A poll cycle
+adds rows in the same transaction that records the incident, and they are sent
+after it commits. So a cycle that rolls back sends nothing, each channel fails
+and retries alone, and one channel being down can't hold up the others.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional
+
+import requests
+
+import db
+
+log = logging.getLogger("skyfarer.notifiers")
+
+
+def _env_list(name: str, default: str = "") -> list[str]:
+    return [v.strip() for v in os.getenv(name, default).split(",") if v.strip()]
+
+
+EVENTS = ("opened", "updated", "resolved")
+
+NOTIFY_EVENTS = _env_list("NOTIFY_EVENTS", "opened,resolved")
+NOTIFY_MAX_AGE_HOURS = float(os.getenv("NOTIFY_MAX_AGE_HOURS", "24"))
+NOTIFY_MAINTENANCE = os.getenv("NOTIFY_MAINTENANCE", "").lower() in ("1", "true", "yes")
+NOTIFY_RETRY_HOURS = float(os.getenv("NOTIFY_RETRY_HOURS", "24"))
+
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL", "")
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN", "")
+ZD_PRIORITY = os.getenv("ZD_TICKET_PRIORITY", "high")
+ZD_TAGS = _env_list("ZD_TICKET_TAGS", "skyfarer,auto-raised")
+
+_ZD_GROUP_ID_RAW = os.getenv("ZD_TICKET_GROUP_ID", "") or None
+if _ZD_GROUP_ID_RAW is None:
+    ZD_GROUP_ID: Optional[int] = None
+else:
+    try:
+        # Validated once here, so a misconfigured value fails at startup
+        # rather than on the first new incident.
+        ZD_GROUP_ID = int(_ZD_GROUP_ID_RAW)
+    except ValueError:
+        raise SystemExit(
+            f"ZD_TICKET_GROUP_ID must be a valid integer, got: {_ZD_GROUP_ID_RAW!r}"
+        )
+
+PUSHOVER_API_URL = os.getenv("PUSHOVER_API_URL", "https://api.pushover.net/1/messages.json")
+PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
+PUSHOVER_USER = os.getenv("PUSHOVER_USER", "")
+PUSHOVER_PRIORITY = os.getenv("PUSHOVER_PRIORITY", "0")
+
+PAGERDUTY_EVENTS_URL = os.getenv("PAGERDUTY_EVENTS_URL", "https://events.pagerduty.com/v2/enqueue")
+PAGERDUTY_ROUTING_KEY = os.getenv("PAGERDUTY_ROUTING_KEY", "")
+PAGERDUTY_SEVERITY = os.getenv("PAGERDUTY_SEVERITY", "error")
+PAGERDUTY_SEVERITIES = ("critical", "error", "warning", "info")
+
+TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
+
+SNMP_TRAP_TARGETS = _env_list("SNMP_TRAP_TARGETS")
+SNMP_COMMUNITY = os.getenv("SNMP_COMMUNITY", "")
+# Under the experimental arc until you have your own enterprise number. If you
+# change it, change SKYFARER-MIB.txt to match.
+SNMP_BASE_OID = os.getenv("SNMP_BASE_OID", "1.3.6.1.3.77701").rstrip(".")
+SNMP_TRAP_NUMBERS = {"opened": 1, "updated": 2, "resolved": 3}
+
+
+class PermanentFailure(Exception):
+    """The request can't succeed as it stands: don't send it again."""
+
+
+class RetryLater(Exception):
+    """A temporary problem: leave the notice queued."""
+
+
+def _request(method: str, url: str, **kwargs) -> requests.Response:
+    try:
+        return requests.request(method, url, timeout=30, **kwargs)
+    except requests.RequestException as exc:
+        # Not str(exc): that contains the URL, and a Teams webhook URL is a
+        # secret that would end up in the database and on the dashboard.
+        raise RetryLater(type(exc).__name__) from None
+
+
+def _check(resp: requests.Response, *, retry: tuple[int, ...] = (429,)) -> None:
+    if resp.ok:
+        return
+    message = f"HTTP {resp.status_code}"
+    if resp.status_code >= 500 or resp.status_code in retry:
+        raise RetryLater(message)
+    raise PermanentFailure(message)
+
+
+def _subject(row: dict) -> str:
+    n = row["payload"]
+    return f"[{n['provider']}] {n['region']} – {n['title']}"
+
+
+# ─── Zendesk ────────────────────────────────────────────────────────────────
+
+def _zd_auth() -> tuple[str, str]:
+    return (f"{ZENDESK_EMAIL}/token", ZENDESK_API_TOKEN)
+
+
+def _zd_url(path: str) -> str:
+    return f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/{path}"
+
+
+def zendesk_ticket(row: dict) -> dict:
+    n = row["payload"]
+    body = (
+        f"**Provider:** {n['provider']}\n"
+        f"**Region:** {n['region']}\n"
+        f"**Link:** {n['link']}\n\n"
+        f"--- Timeline ---\n\n"
+        f"**Incident published:** {n['published']}\n"
+        f"**Last updated:**       {n['updated']}\n"
+        f"**Detected by poller:** {n['noticed']}\n\n"
+        f"--- Detail ---\n\n"
+        f"{n['summary']}"
+    )
+    ticket: dict = {
+        "subject": _subject(row)[:150],
+        "comment": {"body": body},
+        "priority": ZD_PRIORITY,
+        "tags": ZD_TAGS,
+    }
+    if ZD_GROUP_ID is not None:
+        ticket["group_id"] = ZD_GROUP_ID
+    return {"ticket": ticket}
+
+
+def zendesk_resolve(row: dict) -> dict:
+    n = row["payload"]
+    comment = (
+        f"**Incident resolved by {n['provider']}**\n\n"
+        f"**Resolution detected:** {n['noticed']}\n"
+        f"**Feed last updated:**   {n['updated']}\n"
+        f"**Link:** {n['link']}\n\n"
+        f"--- Latest detail ---\n\n"
+        f"{n['summary']}\n\n"
+        f"---\n\n"
+        f"This ticket has been moved to **pending** for manual review and closure."
+    )
+    return {"ticket": {"status": "pending", "comment": {"body": comment, "public": False}}}
+
+
+def zendesk_note(row: dict) -> dict:
+    n = row["payload"]
+    count = n.get("update_count", 1)
+    heading = (f"**{count} new updates from {n['provider']}**"
+               if count > 1 else f"**New update from {n['provider']}**")
+    comment = (
+        f"{heading}\n\n"
+        f"**Latest published:** {n['published']}\n"
+        f"**Link:** {n['link']}\n\n"
+        f"--- Latest detail ---\n\n"
+        f"{n['title']}\n\n{n['summary']}"
+    )
+    return {"ticket": {"comment": {"body": comment, "public": False}}}
+
+
+def send_zendesk(row: dict) -> Optional[int]:
+    """Returns the ticket ID when one is created."""
+    # An expired token gets fixed: keep those tickets queued until it is.
+    retry = (401, 403, 429)
+    if row["event"] == "opened":
+        resp = _request("POST", _zd_url("tickets.json"),
+                        json=zendesk_ticket(row), auth=_zd_auth())
+        _check(resp, retry=retry)
+        return resp.json().get("ticket", {}).get("id")
+
+    if not row["ticket_id"]:
+        raise PermanentFailure("incident has no ticket")
+    payload = zendesk_resolve(row) if row["event"] == "resolved" else zendesk_note(row)
+    resp = _request("PUT", _zd_url(f"tickets/{row['ticket_id']}.json"),
+                    json=payload, auth=_zd_auth())
+    _check(resp, retry=retry)
+    return None
+
+
+# ─── Pushover ───────────────────────────────────────────────────────────────
+
+def pushover_message(row: dict) -> dict:
+    n = row["payload"]
+    message = {
+        "token": PUSHOVER_TOKEN,
+        "user": PUSHOVER_USER,
+        "title": f"{row['event'].capitalize()}: [{n['provider']}] {n['region']}"[:250],
+        "message": f"{n['title']}\n\n{n['summary']}"[:1024],
+        "url": n["link"][:512],
+        "url_title": "Status page",
+        "priority": 0,
+    }
+    if row["event"] == "opened":
+        message["priority"] = int(PUSHOVER_PRIORITY)
+        if message["priority"] == 2:  # emergency: required by the API
+            message["retry"] = 60
+            message["expire"] = 3600
+    return message
+
+
+def send_pushover(row: dict) -> None:
+    resp = _request("POST", PUSHOVER_API_URL, data=pushover_message(row))
+    # Pushover's rule: a 4xx, 429 included, won't succeed on retry, and
+    # repeating them can get the address blocked.
+    _check(resp, retry=())
+
+
+# ─── PagerDuty ──────────────────────────────────────────────────────────────
+
+def pagerduty_event(row: dict) -> dict:
+    n = row["payload"]
+    # Kept from before the rename to Skyfarer: a resolve must carry the same key
+    # as its trigger, and alerts raised before the rename may still be open.
+    dedup_key = f"cloud-status-{row['incident_id']}"
+    if row["event"] == "resolved":
+        return {"routing_key": PAGERDUTY_ROUTING_KEY, "event_action": "resolve",
+                "dedup_key": dedup_key}
+    return {
+        "routing_key": PAGERDUTY_ROUTING_KEY,
+        "event_action": "trigger",
+        "dedup_key": dedup_key,
+        "client": "Skyfarer",
+        "links": [{"href": n["link"], "text": f"{n['provider']} status page"}],
+        "payload": {
+            "summary": _subject(row)[:1024],
+            "source": f"{n['provider']} {n['region']}",
+            "severity": PAGERDUTY_SEVERITY,
+            "component": n["region"],
+            "group": n["provider"],
+            "class": "cloud-status",
+            "custom_details": {"published": n["published"], "detail": n["summary"]},
+        },
+    }
+
+
+def send_pagerduty(row: dict) -> None:
+    resp = _request("POST", PAGERDUTY_EVENTS_URL, json=pagerduty_event(row))
+    _check(resp)
+
+
+# ─── Microsoft Teams ────────────────────────────────────────────────────────
+
+def teams_card(row: dict) -> dict:
+    n = row["payload"]
+    heading = {"opened": "Cloud incident opened", "updated": "Cloud incident updated",
+               "resolved": "Cloud incident resolved"}[row["event"]]
+    color = {"opened": "Attention", "updated": "Warning", "resolved": "Good"}[row["event"]]
+    return {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": None,
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.2",
+                "body": [
+                    {"type": "TextBlock", "text": heading, "weight": "Bolder",
+                     "size": "Medium", "color": color},
+                    {"type": "TextBlock", "text": n["title"], "wrap": True, "weight": "Bolder"},
+                    {"type": "FactSet", "facts": [
+                        {"title": "Provider", "value": n["provider"]},
+                        {"title": "Region", "value": n["region"]},
+                        {"title": "Published", "value": n["published"]},
+                    ]},
+                    {"type": "TextBlock", "text": n["summary"][:1500], "wrap": True},
+                ],
+                "actions": [{"type": "Action.OpenUrl", "title": "Status page",
+                             "url": n["link"]}],
+            },
+        }],
+    }
+
+
+def send_teams(row: dict) -> None:
+    _check(_request("POST", TEAMS_WEBHOOK_URL, json=teams_card(row)))
+
+
+# ─── SNMP traps ─────────────────────────────────────────────────────────────
+
+def _snmp_target(target: str) -> tuple[str, int]:
+    host, _, port = target.partition(":")
+    return host, int(port or 162)
+
+
+def snmp_varbinds(row: dict) -> list[tuple[str, object]]:
+    """(OID, value) pairs for the trap. Values are str or int."""
+    n = row["payload"]
+    return [
+        (f"{SNMP_BASE_OID}.1.1", n["provider"]),
+        (f"{SNMP_BASE_OID}.1.2", n["region"][:255]),
+        (f"{SNMP_BASE_OID}.1.3", n["title"][:255]),
+        (f"{SNMP_BASE_OID}.1.4", n["link"][:255]),
+        (f"{SNMP_BASE_OID}.1.5", row["incident_id"]),
+    ]
+
+
+async def _send_traps(row: dict) -> None:
+    # Imported here so that only people using traps load the SNMP stack.
+    from pysnmp.hlapi.v3arch.asyncio import (
+        CommunityData, ContextData, NotificationType, ObjectIdentity, ObjectType,
+        SnmpEngine, UdpTransportTarget, send_notification)
+    from pysnmp.proto.rfc1902 import Integer32, OctetString
+
+    oid = f"{SNMP_BASE_OID}.0.{SNMP_TRAP_NUMBERS[row['event']]}"
+    varbinds = [
+        ObjectType(ObjectIdentity(name),
+                   Integer32(value) if isinstance(value, int) else OctetString(value))
+        for name, value in snmp_varbinds(row)
+    ]
+    engine = SnmpEngine()
+    try:
+        for target in SNMP_TRAP_TARGETS:
+            error, *_ = await send_notification(
+                engine, CommunityData(SNMP_COMMUNITY, mpModel=1),
+                await UdpTransportTarget.create(_snmp_target(target)),
+                ContextData(), "trap",
+                NotificationType(ObjectIdentity(oid)).add_varbinds(*varbinds))
+            if error:
+                raise RetryLater(f"{target}: {error}")
+    finally:
+        engine.close_dispatcher()
+
+
+def send_snmp(row: dict) -> None:
+    """A trap is one UDP packet with no acknowledgement: `sent` means it left
+    this host, not that a receiver got it."""
+    asyncio.run(_send_traps(row))
+
+
+# ─── Channels ───────────────────────────────────────────────────────────────
+
+SENDERS: dict[str, Callable[[dict], Optional[int]]] = {
+    "zendesk": send_zendesk,
+    "pushover": send_pushover,
+    "pagerduty": send_pagerduty,
+    "teams": send_teams,
+    "snmp": send_snmp,
+}
+
+# PagerDuty alerts have no "update" action: an event would just re-trigger.
+CHANNEL_EVENTS = {
+    "pushover": EVENTS,
+    "pagerduty": ("opened", "resolved"),
+    "teams": EVENTS,
+    "snmp": EVENTS,
+}
+
+
+def enabled_channels() -> list[str]:
+    channels = []
+    if ZENDESK_SUBDOMAIN and ZENDESK_EMAIL and ZENDESK_API_TOKEN:
+        channels.append("zendesk")
+    if PUSHOVER_TOKEN and PUSHOVER_USER:
+        channels.append("pushover")
+    if PAGERDUTY_ROUTING_KEY:
+        channels.append("pagerduty")
+    if TEAMS_WEBHOOK_URL:
+        channels.append("teams")
+    if SNMP_TRAP_TARGETS:
+        channels.append("snmp")
+    return channels
+
+
+def config_errors() -> list[str]:
+    """Mistakes to report at startup rather than on the first incident."""
+    errors = []
+    if any((ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN)) and not all(
+            (ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN)):
+        errors.append("Zendesk needs ZENDESK_SUBDOMAIN, ZENDESK_EMAIL and ZENDESK_API_TOKEN")
+    if bool(PUSHOVER_TOKEN) != bool(PUSHOVER_USER):
+        errors.append("Pushover needs both PUSHOVER_TOKEN and PUSHOVER_USER")
+    if PUSHOVER_PRIORITY not in ("-2", "-1", "0", "1", "2"):
+        errors.append(f"PUSHOVER_PRIORITY must be -2 to 2, got: {PUSHOVER_PRIORITY!r}")
+    if PAGERDUTY_SEVERITY not in PAGERDUTY_SEVERITIES:
+        errors.append(f"PAGERDUTY_SEVERITY must be one of {', '.join(PAGERDUTY_SEVERITIES)}, "
+                      f"got: {PAGERDUTY_SEVERITY!r}")
+    if SNMP_TRAP_TARGETS and not SNMP_COMMUNITY:
+        errors.append("SNMP_TRAP_TARGETS needs SNMP_COMMUNITY")
+    for target in SNMP_TRAP_TARGETS:
+        try:
+            _snmp_target(target)
+        except ValueError:
+            errors.append(f"SNMP_TRAP_TARGETS has a bad port: {target!r}")
+    unknown = [e for e in NOTIFY_EVENTS if e not in EVENTS]
+    if unknown:
+        errors.append(f"NOTIFY_EVENTS must be from {', '.join(EVENTS)}, got: {', '.join(unknown)}")
+    return errors
+
+
+# ─── Queue ──────────────────────────────────────────────────────────────────
+
+def enqueue(conn, incident_id: int, event: str, payload: dict, *, alert: bool = True) -> None:
+    """Queue a notice for each channel that should get it. `alert` False keeps
+    an incident away from the channels that interrupt people; Zendesk records
+    everything. Those channels only hear how an incident ends if they heard it
+    begin, so a suppressed incident stays silent throughout."""
+    for channel in enabled_channels():
+        if channel != "zendesk":
+            if event not in NOTIFY_EVENTS or event not in CHANNEL_EVENTS[channel]:
+                continue
+            if event == "opened":
+                if not alert:
+                    continue
+            elif not db.was_notified(conn, incident_id, channel):
+                continue
+        db.add_notification(conn, incident_id=incident_id, channel=channel,
+                            event=event, payload=payload)
+
+
+def deliver_pending() -> int:
+    """Send what's due. Returns how many were sent. Each result is saved as it
+    happens, so a crash partway through doesn't repeat earlier sends."""
+    now = datetime.now(timezone.utc)
+    with db.get_conn() as conn:
+        rows = db.pending_notifications(conn)
+
+    sent = 0
+    held: set[tuple[int, str]] = set()  # keeps each incident's notices in order
+    new_tickets: dict[int, int] = {}    # created during this pass
+    for row in rows:
+        key = (row["incident_id"], row["channel"])
+        if key in held:
+            continue
+        if row["next_attempt_at"] > now:
+            held.add(key)
+            continue
+
+        # `rows` was read before this pass, so a ticket opened a moment ago
+        # isn't in it, and the same pass can hold that ticket's first update.
+        row["ticket_id"] = row["ticket_id"] or new_tickets.get(row["incident_id"])
+
+        sender = SENDERS[row["channel"]] if row["channel"] in enabled_channels() else None
+        try:
+            if sender is None:
+                raise PermanentFailure("channel no longer configured")
+            result = sender(row)
+        except PermanentFailure as exc:
+            log.error("%s %s failed for good: %s", row["channel"], row["event"], exc)
+            with db.get_conn() as conn:
+                db.notification_failed(conn, row["id"], str(exc))
+        except Exception as exc:
+            error = str(exc) if isinstance(exc, RetryLater) else type(exc).__name__
+            held.add(key)
+            with db.get_conn() as conn:
+                if now - row["created_at"] > timedelta(hours=NOTIFY_RETRY_HOURS):
+                    log.error("%s %s gave up: %s", row["channel"], row["event"], error)
+                    db.notification_failed(conn, row["id"], f"gave up: {error}")
+                else:
+                    log.warning("%s %s will retry: %s", row["channel"], row["event"], error)
+                    delay = min(60 * 2 ** row["attempts"], 3600)
+                    db.notification_retry(conn, row["id"], error,
+                                          now + timedelta(seconds=delay))
+        else:
+            sent += 1
+            log.info("%s %s sent for incident %s", row["channel"], row["event"],
+                     row["incident_id"])
+            with db.get_conn() as conn:
+                db.notification_sent(conn, row["id"])
+                if row["channel"] == "zendesk" and result:
+                    db.set_ticket(conn, row["incident_id"], result)
+                    new_tickets[row["incident_id"]] = result
+    return sent
