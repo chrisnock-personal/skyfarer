@@ -1,0 +1,107 @@
+{% extends "settings_base.html" %}
+{% block title %}Users and access · Skyfarer{% endblock %}
+{% block heading %}
+<div>
+  <h1>Users and access</h1>
+  <p class="lede">Only admins see this page.</p>
+</div>
+{% endblock %}
+{% block content %}
+{% if error %}<div class="flash bad" role="alert">{{ error }}</div>{% endif %}
+
+<section class="roles" aria-label="Roles">
+  <div class="card"><span class="badge role-admin">Admin</span>Sees everything, changes providers, channels and rules, replaces keys, and manages people.</div>
+  <div class="card"><span class="badge role-viewer">Viewer</span>Sees the dashboard: incidents, deliveries and the poll log. No settings pages at all.</div>
+</section>
+
+<section class="card panel" aria-labelledby="people-h">
+  <div class="panel-head">
+    <h2 id="people-h">People</h2>
+    {% if not adding and not new_link %}<a class="btn primary" href="{{ url_for('admin.users', add=1) }}">Add a person</a>{% endif %}
+  </div>
+
+  {% if new_link %}
+  <div class="editor" style="background: var(--surface2)">
+    <strong>Setup link for {{ new_link.name }} ({{ new_link.role|capitalize }})</strong>
+    <div class="link-box">
+      <code id="setup-link">{{ new_link.url }}</code>
+      <button type="button" class="btn" onclick="var b=this; navigator.clipboard.writeText(document.getElementById('setup-link').textContent).then(function(){ b.textContent='Copied'; });">Copy</button>
+      <a class="btn" href="{{ url_for('admin.users') }}">Done</a>
+    </div>
+    <p class="hint">Skyfarer doesn't send email: pass this on yourself. It works once and expires in 24 hours, and it's shown only now. Make a new one if it's lost.</p>
+  </div>
+  {% elif adding %}
+  <form class="editor" method="post" action="{{ url_for('admin.user_new') }}" style="background: var(--surface2)">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <div class="form-grid">
+      <div class="field"><label for="n-name">Name</label><input class="input" id="n-name" name="name" value="{{ form.get('name', '') }}" required></div>
+      <div class="field"><label for="n-email">Email</label><input class="input" id="n-email" name="email" type="email" value="{{ form.get('email', '') }}" required></div>
+      <div class="field"><label for="n-role">Role</label>
+        <select id="n-role" name="role"><option value="viewer" {% if form.get('role') != 'admin' %}selected{% endif %}>Viewer</option><option value="admin" {% if form.get('role') == 'admin' %}selected{% endif %}>Admin</option></select>
+      </div>
+    </div>
+    <div class="actions">
+      <p class="hint">You get a link to pass on; the person opens it and picks their own password.</p>
+      <div class="end"><a class="btn" href="{{ url_for('admin.users') }}">Cancel</a><button type="submit" class="btn primary">Create setup link</button></div>
+    </div>
+  </form>
+  {% endif %}
+
+  <div class="scroll">
+    <table class="people">
+      <thead><tr><th scope="col">Person</th><th scope="col">Role</th><th scope="col">Last signed in</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+      <tbody>
+      {% for p in people %}
+        {% set you = current_user and p.id == current_user.id %}
+        <tr>
+          <td><div class="person"><span class="avatar" aria-hidden="true">{{ p.name[:1]|upper }}</span><div><strong>{{ p.name }}</strong><small>{{ p.email }}</small></div></div></td>
+          <td>
+            {% if you %}
+              <span class="badge role-{{ p.role }}">{{ p.role|capitalize }}</span>
+            {% else %}
+            <form method="post" action="{{ url_for('admin.user_role', user_id=p.id) }}">
+              <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+              <label class="sr-only" for="role-{{ p.id }}">Role for {{ p.name }}</label>
+              <select id="role-{{ p.id }}" name="role" onchange="this.form.submit()">
+                <option value="admin" {% if p.role == 'admin' %}selected{% endif %}>Admin</option>
+                <option value="viewer" {% if p.role == 'viewer' %}selected{% endif %}>Viewer</option>
+              </select>
+              <noscript><button class="btn small" type="submit">Change</button></noscript>
+            </form>
+            {% endif %}
+          </td>
+          <td class="sub {{ 'tone-warn' if not p.active }}">{{ p.last }}</td>
+          <td style="text-align: right; white-space: nowrap">
+            {% if you %}<span class="hint">You</span>{% else %}
+            <form method="post" action="{{ url_for('admin.user_link', user_id=p.id) }}">
+              <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+              <button type="submit" class="btn small">{{ 'Reset password' if p.active else 'New setup link' }}</button>
+            </form>
+            <form method="post" action="{{ url_for('admin.user_delete', user_id=p.id) }}">
+              <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+              <button type="submit" class="btn small danger">Remove</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="hint" style="padding: 12px 20px 16px; border-top: 1px solid var(--border)">There's always at least one admin: the last one can't be removed or made a viewer, and nobody can change their own role.</p>
+</section>
+
+<section class="card panel" aria-labelledby="hist-h">
+  <div class="panel-head">
+    <h2 id="hist-h">Change history</h2>
+    <span class="hint">Secret values are never recorded, only that they changed</span>
+  </div>
+  {% if history %}
+  <ol class="history">
+    {% for h in history %}
+    <li><span class="when">{{ h.at.strftime('%d %b %H:%M') }}</span><span class="who-col">{{ h.actor }}</span><span class="what">{{ h.what }}</span></li>
+    {% endfor %}
+  </ol>
+  {% else %}<div class="empty">No changes yet.</div>{% endif %}
+</section>
+{% endblock %}

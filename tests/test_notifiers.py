@@ -229,21 +229,15 @@ class ServiceNow(unittest.TestCase):
 
 
 class Webhook(unittest.TestCase):
-    def setUp(self):
-        p = mock.patch.object(notifiers, "WEBHOOK_URL", "https://hooks.example.test/in")
-        p.start()
-        self.addCleanup(p.stop)
+    def hook(self, **fields):
+        return notifiers.Webhook(**{"id": 3, "name": "Test", "url": "https://hooks.example.test/in",
+                                    **fields})
 
-    def send(self, r, **settings):
-        patches = [mock.patch.object(notifiers, k, v) for k, v in settings.items()]
-        for p in patches:
-            p.start()
-        try:
-            with mock.patch.object(notifiers, "_request", return_value=response(200)) as req:
-                notifiers.send_webhook(r)
-        finally:
-            for p in patches:
-                p.stop()
+    def send(self, r, **fields):
+        hook = self.hook(**fields)
+        with mock.patch.object(notifiers, "WEBHOOKS", [hook]), \
+                mock.patch.object(notifiers, "_request", return_value=response(200)) as req:
+            notifiers.send_webhook({**r, "channel": hook.channel})
         return req.call_args
 
     def test_default_body_has_every_field(self):
@@ -262,50 +256,76 @@ class Webhook(unittest.TestCase):
         r = row()
         r["payload"]["title"] = 'Say "hi"\nnext line'
         template = '{"text": "{{event}}: {{title}}", "id": {{incident_id}}}'
-        body = json.loads(self.send(r, WEBHOOK_TEMPLATE=template).kwargs["data"])
+        body = json.loads(self.send(r, template=template).kwargs["data"])
         self.assertEqual(body, {"text": 'opened: Say "hi"\nnext line', "id": 7})
 
     def test_plain_text_template(self):
-        call = self.send(row(), WEBHOOK_TEMPLATE="{{ provider }} {{region}}: {{title}}",
-                         WEBHOOK_CONTENT_TYPE="text/plain")
+        call = self.send(row(), template="{{ provider }} {{region}}: {{title}}",
+                         content_type="text/plain")
         self.assertEqual(call.kwargs["data"], b"AWS eu-west-2: Service impact")
         self.assertEqual(call.kwargs["headers"]["Content-Type"], "text/plain")
 
     def test_signature_and_headers(self):
-        call = self.send(row(), WEBHOOK_SECRET="s3cret",
-                         WEBHOOK_HEADERS_RAW='{"Authorization": "Bearer abc"}')
+        call = self.send(row(), secret="s3cret", headers='{"Authorization": "Bearer abc"}')
         headers, body = call.kwargs["headers"], call.kwargs["data"]
         expected = hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
         self.assertEqual(headers["X-Skyfarer-Signature"], f"sha256={expected}")
         self.assertEqual(headers["Authorization"], "Bearer abc")
 
+    def test_each_webhook_uses_its_own_settings(self):
+        a = self.hook(id=1, url="https://a.example.test/", method="PUT")
+        b = self.hook(id=2, url="https://b.example.test/")
+        with mock.patch.object(notifiers, "WEBHOOKS", [a, b]), \
+                mock.patch.object(notifiers, "_request", return_value=response(200)) as req:
+            notifiers.send_webhook({**row(), "channel": "webhook-2"})
+            notifiers.send_webhook({**row(), "channel": "webhook-1"})
+        self.assertEqual([c.args for c in req.call_args_list],
+                         [("POST", "https://b.example.test/"), ("PUT", "https://a.example.test/")])
+        self.assertEqual(notifiers.sender_for("webhook-2"), notifiers.send_webhook)
+
+    def test_deleted_webhook_fails_for_good(self):
+        with mock.patch.object(notifiers, "WEBHOOKS", []):
+            with self.assertRaises(notifiers.PermanentFailure):
+                notifiers.send_webhook({**row(), "channel": "webhook-9"})
+
     def test_retries_like_the_others(self):
         for status, error in ((503, notifiers.RetryLater), (429, notifiers.RetryLater),
                               (404, notifiers.PermanentFailure)):
-            with mock.patch.object(notifiers, "_request", return_value=response(status)):
+            with mock.patch.object(notifiers, "WEBHOOKS", [self.hook()]), \
+                    mock.patch.object(notifiers, "_request", return_value=response(status)):
                 with self.assertRaises(error):
-                    notifiers.send_webhook(row())
+                    notifiers.send_webhook({**row(), "channel": "webhook-3"})
 
-    def test_config_errors(self):
-        self.assertEqual(notifiers.config_errors(), [])
-        for name, value in (("WEBHOOK_URL", "ftp://x"), ("WEBHOOK_METHOD", "GET"),
-                            ("WEBHOOK_HEADERS_RAW", '{"X": 1}'),
-                            ("WEBHOOK_TEMPLATE", '{"t": "{{titel}}"}'),
-                            ("WEBHOOK_TEMPLATE", '{"t": {{title}}}'),
-                            ("WEBHOOK_EVENTS", ["started"])):
-            with mock.patch.object(notifiers, name, value):
-                self.assertTrue(notifiers.config_errors(), (name, value))
+    def test_errors(self):
+        self.assertEqual(notifiers.webhook_errors(self.hook()), [])
+        for fields in ({"url": "ftp://x"}, {"method": "GET"}, {"headers": '{"X": 1}'},
+                       {"template": '{"t": "{{titel}}"}'}, {"template": '{"t": {{title}}}'},
+                       {"events": ["started"]}):
+            self.assertTrue(notifiers.webhook_errors(self.hook(**fields)), fields)
+        with mock.patch.object(notifiers, "WEBHOOKS", [self.hook(method="GET")]):
+            self.assertTrue(any("Webhook 'Test'" in e for e in notifiers.config_errors()))
 
     def test_own_event_list(self):
         def queued(event, events):
-            with mock.patch.object(notifiers, "enabled_channels", return_value=["webhook", "teams"]), \
-                    mock.patch.object(notifiers, "WEBHOOK_EVENTS", events), \
+            hook = self.hook(events=events)
+            with mock.patch.object(notifiers, "WEBHOOKS", [hook]), \
+                    mock.patch.object(notifiers, "enabled_channels", return_value=[hook.channel, "teams"]), \
                     mock.patch.object(notifiers.db, "was_notified", return_value=True), \
                     mock.patch.object(notifiers.db, "add_notification") as add:
                 notifiers.enqueue(None, 7, event, dict(NOTICE))
             return {c.kwargs["channel"] for c in add.call_args_list}
-        self.assertEqual(queued("updated", ["opened", "updated", "resolved"]), {"webhook"})
+        self.assertEqual(queued("updated", ["opened", "updated", "resolved"]), {"webhook-3"})
         self.assertEqual(queued("opened", ["resolved"]), {"teams"})
+        # No list of its own: it follows NOTIFY_EVENTS like the others.
+        self.assertEqual(queued("opened", []), {"webhook-3", "teams"})
+
+    def test_env_describes_one_webhook(self):
+        env = {"WEBHOOK_URL": "https://h.example.test/", "WEBHOOK_SECRET": "x",
+               "WEBHOOK_EVENTS": "opened"}
+        with mock.patch.dict(os.environ, env):
+            hooks = notifiers._env_webhook()
+        self.assertEqual([(h.channel, h.url, h.secret, h.events) for h in hooks],
+                         [("webhook-1", "https://h.example.test/", "x", ["opened"])])
 
 
 class Enqueue(unittest.TestCase):

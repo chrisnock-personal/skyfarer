@@ -1,0 +1,131 @@
+{% extends "settings_base.html" %}
+{% block title %}Providers and regions · Skyfarer{% endblock %}
+{% block heading %}
+<div>
+  <h1>Providers and regions</h1>
+  <p class="lede">Skyfarer reads each provider's public status page and keeps what touches these regions. Use the provider's own names; codes match as whole words, and <code class="mono">*</code> keeps everything that provider publishes.</p>
+</div>
+{% endblock %}
+{% macro tag_editor(key, values, what, placeholder, suggestions=[]) %}
+<div class="tags" data-list>
+  <span class="label">{{ what }}</span>
+  {% for v in values %}
+  <span class="tag" data-value="{{ v }}">{{ v }}<button type="button" data-remove aria-label="Remove {{ v }}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button></span>
+  {% endfor %}
+</div>
+<div class="tag-add">
+  <input class="input" type="text" data-add placeholder="{{ placeholder }}" aria-label="{{ placeholder }}">
+  <button type="button" class="btn small" data-add-btn>Add</button>
+  {% if suggestions %}
+  <span class="hint">Suggestions:</span>
+  {% for s in suggestions %}<button type="button" class="sugg" data-sugg="{{ s }}">+ {{ s }}</button>{% endfor %}
+  {% endif %}
+</div>
+<input type="hidden" name="{{ key }}" value="{{ values|join(',') }}" data-store>
+{% endmacro %}
+{% block content %}
+<noscript><div class="flash bad">This page needs JavaScript to edit regions.</div></noscript>
+<form method="post" action="{{ url_for('admin.providers') }}" id="providers-form">
+  <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+  <div style="display: flex; flex-direction: column; gap: 12px">
+  {% for c in cards %}
+    <section class="card provider-card {{ '' if c.on else 'off' }}" data-tags aria-labelledby="p-{{ c.p.key }}">
+      <div class="row-head">
+        <div class="title">
+          <strong id="p-{{ c.p.key }}">{{ c.p.label }}</strong>
+          <span>{{ c.p.about }}{% if c.error %} · last poll: {{ c.error }}{% endif %}</span>
+        </div>
+        <span class="badge {{ c.tone }}">{{ c.health }}</span>
+        <label class="sr-only" for="en-{{ c.p.key }}">Watch {{ c.p.label }}</label>
+        <input type="checkbox" class="switch" id="en-{{ c.p.key }}" name="{{ c.p.enabled_key }}" value="true" {% if c.on %}checked{% endif %}>
+      </div>
+      {{ tag_editor(c.p.key, c.regions, 'Regions', 'Add a region to ' ~ c.p.label, c.suggestions) }}
+      {% if c.on and not c.regions %}<p class="hint warn">No regions yet, so nothing from {{ c.p.label }} is kept.</p>{% endif %}
+    </section>
+  {% endfor %}
+
+    <section class="card pad" data-tags aria-labelledby="kw-h">
+      <div>
+        <h2 id="kw-h">Only keep incidents mentioning</h2>
+        <p class="hint">Optional. When set, an incident in your regions must also mention one of these words in its title or text, on every provider. Leave empty to keep everything in your regions.</p>
+      </div>
+      {{ tag_editor('FILTER_KEYWORDS', keywords, 'Words', 'Add a word') }}
+    </section>
+
+    <section class="card pad" aria-labelledby="poll-h">
+      <div class="row-head">
+        <div class="title">
+          <h2 id="poll-h">Polling</h2>
+          <span>How often every feed is read.{% if last_poll %} Last poll {{ last_poll.strftime('%d %b %H:%M UTC') }}.{% endif %}</span>
+        </div>
+        <div class="field">
+          <label for="interval">Poll every</label>
+          <select id="interval" name="POLL_INTERVAL_SECONDS">
+            {% for value, text in interval_options %}<option value="{{ value }}" {% if value == interval %}selected{% endif %}>{{ text }}</option>{% endfor %}
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <div class="savebar" data-savebar>
+      <span class="state" data-state>No unsaved changes</span>
+      <div class="end" style="display: flex; gap: 8px">
+        <a class="btn" href="{{ url_for('admin.providers') }}">Discard</a>
+        <button type="submit" class="btn primary">Save changes</button>
+      </div>
+    </div>
+  </div>
+</form>
+{% endblock %}
+{% block scripts %}
+<script>
+(function () {
+  var form = document.getElementById("providers-form");
+  var bar = document.querySelector("[data-savebar]");
+  function dirty() {
+    bar.classList.add("dirty");
+    bar.querySelector("[data-state]").textContent = "Unsaved changes";
+  }
+  form.addEventListener("change", dirty);
+
+  document.querySelectorAll("[data-tags]").forEach(function (box) {
+    var list = box.querySelector("[data-list]");
+    var store = box.querySelector("[data-store]");
+    var input = box.querySelector("[data-add]");
+    function values() { return Array.prototype.map.call(list.querySelectorAll(".tag"), function (t) { return t.dataset.value; }); }
+    function sync() {
+      store.value = values().join(",");
+      box.querySelectorAll("[data-sugg]").forEach(function (s) { s.hidden = values().indexOf(s.dataset.sugg) >= 0; });
+      dirty();
+    }
+    function tag(value) {
+      var span = document.createElement("span");
+      span.className = "tag"; span.dataset.value = value; span.textContent = value;
+      var btn = document.createElement("button");
+      btn.type = "button"; btn.setAttribute("data-remove", ""); btn.setAttribute("aria-label", "Remove " + value);
+      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+      span.appendChild(btn);
+      return span;
+    }
+    function add(text) {
+      text.split(",").forEach(function (v) {
+        v = v.trim();
+        if (v && values().indexOf(v) < 0) list.appendChild(tag(v));
+      });
+      sync();
+    }
+    list.addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-remove]");
+      if (btn) { btn.parentNode.remove(); sync(); }
+    });
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); add(input.value); input.value = ""; }
+    });
+    box.querySelector("[data-add-btn]").addEventListener("click", function () { add(input.value); input.value = ""; input.focus(); });
+    box.querySelectorAll("[data-sugg]").forEach(function (s) {
+      s.addEventListener("click", function () { add(s.dataset.sugg); });
+    });
+  });
+})();
+</script>
+{% endblock %}

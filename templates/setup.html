@@ -1,0 +1,36 @@
+{% extends "auth_base.html" %}
+{% block title %}Set up Skyfarer{% endblock %}
+{% block card %}
+<form class="card" method="post" action="{{ url_for('admin.setup') }}">
+  <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+  <div>
+    <h1>Set up Skyfarer</h1>
+    <p>No accounts exist yet. Create the first admin; you can add others afterwards.</p>
+  </div>
+  {% if summary and summary != 'nothing set' %}
+  <div class="flash info">
+    <div><strong>Settings found in .env</strong><br><span class="hint">{{ summary }}. They've been imported, and are edited here from now on.</span></div>
+  </div>
+  {% endif %}
+  {% if error %}<div class="flash bad" role="alert">{{ error }}</div>{% endif %}
+  <div class="field">
+    <label for="code">Setup code</label>
+    <input class="input mono" id="code" name="code" autocomplete="off" value="{{ form.get('code', '') }}" required>
+    <span class="help">Printed in the dashboard's log, for example by <code class="mono">docker compose logs dashboard</code>.</span>
+  </div>
+  <div class="field">
+    <label for="name">Name</label>
+    <input class="input" id="name" name="name" autocomplete="name" value="{{ form.get('name', '') }}" required>
+  </div>
+  <div class="field">
+    <label for="email">Email</label>
+    <input class="input" id="email" name="email" type="email" autocomplete="username" value="{{ form.get('email', '') }}" required>
+  </div>
+  <div class="field">
+    <label for="password">Password</label>
+    <input class="input" id="password" name="password" type="password" autocomplete="new-password" minlength="12" required>
+    <span class="help">At least 12 characters.</span>
+  </div>
+  <button type="submit" class="btn primary">Create admin account</button>
+</form>
+{% endblock %}

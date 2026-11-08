@@ -10,6 +10,7 @@ incident_updates  – later feed entries about an incident (AWS posts each
                     update as a separate entry, Azure rewords its entries)
 notifications     – delivery queue: one row per notice per channel
 poll_log          – one row per poll cycle for observability
+settings, webhooks, users, settings_log – see settings.py
 """
 
 from __future__ import annotations
@@ -120,6 +121,50 @@ CREATE TABLE IF NOT EXISTS tickets (
 
 -- Feeds that could not be read in a cycle, as "Provider: reason; ...".
 ALTER TABLE poll_log ADD COLUMN IF NOT EXISTS feed_errors TEXT;
+
+-- Settings edited in the dashboard (see settings.py). Keys are the .env names;
+-- secrets are encrypted. Keys starting with "_" are Skyfarer's own markers.
+CREATE TABLE IF NOT EXISTS settings (
+    key             TEXT PRIMARY KEY,
+    value           TEXT NOT NULL,
+    secret          BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by      TEXT
+);
+
+-- Outbound webhooks; their headers and signing secret are in settings.
+CREATE TABLE IF NOT EXISTS webhooks (
+    id              SERIAL PRIMARY KEY,
+    name            TEXT NOT NULL,
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    url             TEXT NOT NULL,
+    method          TEXT NOT NULL DEFAULT 'POST',
+    events          TEXT NOT NULL DEFAULT '',      -- empty: follow NOTIFY_EVENTS
+    template        TEXT NOT NULL DEFAULT '',
+    content_type    TEXT NOT NULL DEFAULT 'application/json',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id              SERIAL PRIMARY KEY,
+    email           TEXT UNIQUE NOT NULL,
+    name            TEXT NOT NULL,
+    role            TEXT NOT NULL CHECK (role IN ('admin', 'viewer')),
+    password_hash   TEXT,                          -- NULL until the setup link is used
+    setup_token     TEXT,                          -- SHA-256 of the one-time link's token
+    setup_expires   TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_login      TIMESTAMPTZ
+);
+
+-- Who changed what. Secret values are never written here.
+CREATE TABLE IF NOT EXISTS settings_log (
+    id              SERIAL PRIMARY KEY,
+    at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor           TEXT NOT NULL,
+    what            TEXT NOT NULL
+);
 """
 
 

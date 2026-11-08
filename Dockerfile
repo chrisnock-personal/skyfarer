@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY poller.py feeds.py db.py dashboard.py notifiers.py ./
+COPY poller.py feeds.py db.py dashboard.py notifiers.py settings.py admin.py ./
 COPY templates/ templates/
 COPY static/ static/
 

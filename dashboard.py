@@ -2,9 +2,8 @@
 """
 dashboard.py
 ~~~~~~~~~~~~
-Skyfarer's read-only web dashboard over the incidents, notifications and
-poll_log tables. No writes, no calls to any provider or channel -just SELECT
-queries for observability.
+Skyfarer's web dashboard: the incidents, notifications and poll log for
+everyone who signs in, and the settings pages (admin.py) for admins.
 
 Usage:
     python dashboard.py     # serves on 0.0.0.0:$DASHBOARD_PORT (default 8080)
@@ -12,7 +11,9 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -26,8 +27,20 @@ load_dotenv()
 import db  # noqa: E402
 import feeds  # noqa: E402
 import notifiers  # noqa: E402
+import settings  # noqa: E402
+from admin import bp as admin_bp  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s  %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S")
 
 app = Flask(__name__)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    # Set DASHBOARD_HTTPS=true behind a TLS proxy so the cookie is only sent over HTTPS.
+    SESSION_COOKIE_SECURE=os.getenv("DASHBOARD_HTTPS", "").lower() in ("1", "true", "yes"),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
 
 VALID_STATES = ("all", "open", "resolved")
 VALID_RANGES = ("all", "today", "7d", "30d", "90d", "custom")
@@ -43,8 +56,20 @@ CHANNEL_LABELS = {
     "zendesk": "Zendesk", "servicenow": "ServiceNow", "pushover": "Pushover", "pagerduty": "PagerDuty",
     "teams": "Microsoft Teams", "snmp": "SNMP traps", "webhook": "Webhook",
 }
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
+
+
+def channel_label(channel: str) -> str:
+    if channel.startswith("webhook-"):
+        hook = notifiers.webhook_for(channel)
+        return f"Webhook: {hook.name}" if hook else "Webhook (deleted)"
+    return CHANNEL_LABELS.get(channel, channel)
+
+
+def poll_interval() -> int:
+    try:
+        return int(os.getenv("POLL_INTERVAL_SECONDS", "") or 300)
+    except ValueError:
+        return 300
 
 
 def _escape_like(text: str) -> str:
@@ -185,7 +210,7 @@ def fetch_summary():
         "GROUP BY channel")
     last_poll = _query("SELECT * FROM poll_log ORDER BY polled_at DESC LIMIT 1")
     row["undelivered"] = sum(r["n"] for r in undelivered)
-    row["undelivered_channels"] = [CHANNEL_LABELS.get(r["channel"], r["channel"])
+    row["undelivered_channels"] = [channel_label(r["channel"])
                                    for r in undelivered]
     row["open_providers"] = [PROVIDER_LABELS.get(p, p) for p in row["open_providers"] or []]
     row["last_poll"] = last_poll[0] if last_poll else None
@@ -266,7 +291,7 @@ def fetch_channels():
             status, tone, detail = "Idle", "muted", "nothing sent yet"
         if channel not in notifiers.enabled_channels():
             status, tone = "Not configured", "muted"
-        channels.append({"label": CHANNEL_LABELS.get(channel, channel),
+        channels.append({"channel": channel, "label": channel_label(channel),
                          "status": status, "tone": tone, "detail": detail})
     return channels
 
@@ -305,11 +330,12 @@ def _tickets(row) -> list[dict]:
     """Each ticket an incident has, as {label, url}: Zendesk's number, then
     ServiceNow's record."""
     tickets = []
+    zendesk = os.getenv("ZENDESK_SUBDOMAIN", "")
     if row["ticket_id"]:
         tickets.append({
             "label": f"#{row['ticket_id']}",
-            "url": (f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{row['ticket_id']}"
-                    if ZENDESK_SUBDOMAIN else None)})
+            "url": (f"https://{zendesk}.zendesk.com/agent/tickets/{row['ticket_id']}"
+                    if zendesk else None)})
     for t in row.get("other_tickets") or []:
         if t["system"] == "servicenow":
             tickets.append({
@@ -379,10 +405,10 @@ def index():
         incidents=incidents,
         poll_log=fetch_poll_log(start, end),
         notifications=fetch_notifications(start, end),
-        channel_labels=CHANNEL_LABELS,
+        channel_label=channel_label,
         region_count=sum(len(p["regions"].split(", ")) for p in providers),
-        poll_every=(f"{POLL_INTERVAL // 60} min" if POLL_INTERVAL % 60 == 0
-                    else f"{POLL_INTERVAL} s"),
+        poll_every=(f"{poll_interval() // 60} min" if poll_interval() % 60 == 0
+                    else f"{poll_interval()} s"),
         state=state, provider=provider, q=q,
         range_key=range_key, range_labels=RANGE_LABELS, state_labels=STATE_LABELS,
         from_date=from_date, to_date=to_date,
@@ -395,6 +421,19 @@ def healthz():
     return {"status": "ok"}
 
 
+app.config["CHANNEL_HEALTH"] = fetch_channels
+app.register_blueprint(admin_bp)
+
+
+def configure_app() -> None:
+    problem = settings.secret_key_problem()
+    if problem:
+        sys.exit(problem)
+    app.secret_key = settings.session_key()
+    db.init_schema()
+
+
 if __name__ == "__main__":
+    configure_app()
     port = int(os.getenv("DASHBOARD_PORT", "8080"))
     app.run(host="0.0.0.0", port=port)

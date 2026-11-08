@@ -2,7 +2,7 @@
 notifiers.py
 ~~~~~~~~~~~~
 Sends incident notices to Zendesk, ServiceNow, Pushover, PagerDuty, Microsoft
-Teams, SNMP trap receivers and an outbound webhook.
+Teams, SNMP trap receivers and any number of outbound webhooks.
 
 Notices go through the `notifications` table, one row per channel. A poll cycle
 adds rows in the same transaction that records the incident, and they are sent
@@ -20,6 +20,7 @@ import logging
 import re
 import os
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field as dc_field
 from typing import Callable, Optional
 from urllib.parse import urlsplit
 
@@ -35,30 +36,9 @@ def _env_list(name: str, default: str = "") -> list[str]:
 
 
 EVENTS = ("opened", "updated", "resolved")
+PAGERDUTY_SEVERITIES = ("critical", "error", "warning", "info")
+SNMP_TRAP_NUMBERS = {"opened": 1, "updated": 2, "resolved": 3}
 
-NOTIFY_EVENTS = _env_list("NOTIFY_EVENTS", "opened,resolved")
-NOTIFY_MAX_AGE_HOURS = float(os.getenv("NOTIFY_MAX_AGE_HOURS", "24"))
-NOTIFY_MAINTENANCE = os.getenv("NOTIFY_MAINTENANCE", "").lower() in ("1", "true", "yes")
-NOTIFY_RETRY_HOURS = float(os.getenv("NOTIFY_RETRY_HOURS", "24"))
-
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
-ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL", "")
-ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN", "")
-ZD_PRIORITY = os.getenv("ZD_TICKET_PRIORITY", "high")
-ZD_TAGS = _env_list("ZD_TICKET_TAGS", "skyfarer,auto-raised")
-
-_ZD_GROUP_ID_RAW = os.getenv("ZD_TICKET_GROUP_ID", "") or None
-if _ZD_GROUP_ID_RAW is None:
-    ZD_GROUP_ID: Optional[int] = None
-else:
-    try:
-        # Validated once here, so a misconfigured value fails at startup
-        # rather than on the first new incident.
-        ZD_GROUP_ID = int(_ZD_GROUP_ID_RAW)
-    except ValueError:
-        raise SystemExit(
-            f"ZD_TICKET_GROUP_ID must be a valid integer, got: {_ZD_GROUP_ID_RAW!r}"
-        )
 
 def servicenow_url(instance: str) -> str:
     """SERVICENOW_INSTANCE is an instance name ("yourcompany") or its full URL."""
@@ -68,48 +48,107 @@ def servicenow_url(instance: str) -> str:
     return f"https://{instance}.service-now.com"
 
 
-SERVICENOW_URL = servicenow_url(os.getenv("SERVICENOW_INSTANCE", ""))
-SERVICENOW_USER = os.getenv("SERVICENOW_USER", "")
-SERVICENOW_PASSWORD = os.getenv("SERVICENOW_PASSWORD", "")
-SERVICENOW_TOKEN = os.getenv("SERVICENOW_TOKEN", "")          # OAuth bearer, instead of a user
-SERVICENOW_TABLE = os.getenv("SERVICENOW_TABLE", "incident")
-SERVICENOW_IMPACT = os.getenv("SERVICENOW_IMPACT", "2")
-SERVICENOW_URGENCY = os.getenv("SERVICENOW_URGENCY", "2")
-SERVICENOW_ASSIGNMENT_GROUP = os.getenv("SERVICENOW_ASSIGNMENT_GROUP", "")
-SERVICENOW_CALLER = os.getenv("SERVICENOW_CALLER", "")
-SERVICENOW_CATEGORY = os.getenv("SERVICENOW_CATEGORY", "")
-SERVICENOW_RESOLVE = os.getenv("SERVICENOW_RESOLVE", "true").lower() in ("1", "true", "yes")
-SERVICENOW_RESOLVED_STATE = os.getenv("SERVICENOW_RESOLVED_STATE", "6")
-SERVICENOW_CLOSE_CODE = os.getenv("SERVICENOW_CLOSE_CODE", "Resolved by caller")
-SERVICENOW_EXTRA_FIELDS_RAW = os.getenv("SERVICENOW_EXTRA_FIELDS", "")
+@dataclass
+class Webhook:
+    """One outbound webhook. There can be any number; each is its own channel."""
+    id: int
+    name: str
+    url: str
+    method: str = "POST"
+    headers: str = ""              # JSON object of extra headers
+    template: str = ""             # body template; empty sends every field as JSON
+    content_type: str = "application/json"
+    secret: str = ""               # signs the body with HMAC-SHA256
+    events: list[str] = dc_field(default_factory=list)   # empty: follow NOTIFY_EVENTS
 
-PUSHOVER_API_URL = os.getenv("PUSHOVER_API_URL", "https://api.pushover.net/1/messages.json")
-PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
-PUSHOVER_USER = os.getenv("PUSHOVER_USER", "")
-PUSHOVER_PRIORITY = os.getenv("PUSHOVER_PRIORITY", "0")
+    @property
+    def channel(self) -> str:
+        return f"webhook-{self.id}"
 
-PAGERDUTY_EVENTS_URL = os.getenv("PAGERDUTY_EVENTS_URL", "https://events.pagerduty.com/v2/enqueue")
-PAGERDUTY_ROUTING_KEY = os.getenv("PAGERDUTY_ROUTING_KEY", "")
-PAGERDUTY_SEVERITY = os.getenv("PAGERDUTY_SEVERITY", "error")
-PAGERDUTY_SEVERITIES = ("critical", "error", "warning", "info")
 
-TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
+def _env_webhook() -> list[Webhook]:
+    """The single webhook that .env can describe (WEBHOOK_URL and friends)."""
+    if not os.getenv("WEBHOOK_URL"):
+        return []
+    return [Webhook(
+        id=1, name=os.getenv("WEBHOOK_NAME", "Webhook"), url=os.getenv("WEBHOOK_URL", ""),
+        method=os.getenv("WEBHOOK_METHOD", "POST").upper(),
+        headers=os.getenv("WEBHOOK_HEADERS", ""), template=os.getenv("WEBHOOK_TEMPLATE", ""),
+        content_type=os.getenv("WEBHOOK_CONTENT_TYPE", "application/json"),
+        secret=os.getenv("WEBHOOK_SECRET", ""), events=_env_list("WEBHOOK_EVENTS"))]
 
-# Outbound webhook: any URL, with an optional body template (see webhook_body).
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-WEBHOOK_METHOD = os.getenv("WEBHOOK_METHOD", "POST").upper()
-WEBHOOK_HEADERS_RAW = os.getenv("WEBHOOK_HEADERS", "")
-WEBHOOK_TEMPLATE = os.getenv("WEBHOOK_TEMPLATE", "")
-WEBHOOK_CONTENT_TYPE = os.getenv("WEBHOOK_CONTENT_TYPE", "application/json")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-WEBHOOK_EVENTS = _env_list("WEBHOOK_EVENTS") or NOTIFY_EVENTS
 
-SNMP_TRAP_TARGETS = _env_list("SNMP_TRAP_TARGETS")
-SNMP_COMMUNITY = os.getenv("SNMP_COMMUNITY", "")
-# Under the experimental arc until you have your own enterprise number. If you
-# change it, change SKYFARER-MIB.txt to match.
-SNMP_BASE_OID = os.getenv("SNMP_BASE_OID", "1.3.6.1.3.77701").rstrip(".")
-SNMP_TRAP_NUMBERS = {"opened": 1, "updated": 2, "resolved": 3}
+def configure(webhooks: Optional[list[Webhook]] = None) -> None:
+    """Read the settings from the environment. settings.apply() puts the
+    database's values there and calls this before every poll, passing the
+    webhooks, which live in a table of their own."""
+    global NOTIFY_EVENTS, NOTIFY_MAX_AGE_HOURS, NOTIFY_MAINTENANCE, NOTIFY_RETRY_HOURS
+    global ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN, ZD_PRIORITY, ZD_TAGS
+    global ZD_GROUP_ID_RAW, ZD_GROUP_ID
+    global SERVICENOW_URL, SERVICENOW_USER, SERVICENOW_PASSWORD, SERVICENOW_TOKEN
+    global SERVICENOW_TABLE, SERVICENOW_IMPACT, SERVICENOW_URGENCY, SERVICENOW_ASSIGNMENT_GROUP
+    global SERVICENOW_CALLER, SERVICENOW_CATEGORY, SERVICENOW_RESOLVE, SERVICENOW_RESOLVED_STATE
+    global SERVICENOW_CLOSE_CODE, SERVICENOW_EXTRA_FIELDS_RAW
+    global PUSHOVER_API_URL, PUSHOVER_TOKEN, PUSHOVER_USER, PUSHOVER_PRIORITY
+    global PAGERDUTY_EVENTS_URL, PAGERDUTY_ROUTING_KEY, PAGERDUTY_SEVERITY, TEAMS_WEBHOOK_URL
+    global SNMP_TRAP_TARGETS, SNMP_COMMUNITY, SNMP_BASE_OID, WEBHOOKS
+
+    NOTIFY_EVENTS = _env_list("NOTIFY_EVENTS", "opened,resolved")
+    NOTIFY_MAX_AGE_HOURS = _env_float("NOTIFY_MAX_AGE_HOURS", 24)
+    NOTIFY_MAINTENANCE = os.getenv("NOTIFY_MAINTENANCE", "").lower() in ("1", "true", "yes")
+    NOTIFY_RETRY_HOURS = _env_float("NOTIFY_RETRY_HOURS", 24)
+
+    ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
+    ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL", "")
+    ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN", "")
+    ZD_PRIORITY = os.getenv("ZD_TICKET_PRIORITY", "high")
+    ZD_TAGS = _env_list("ZD_TICKET_TAGS", "skyfarer,auto-raised")
+    ZD_GROUP_ID_RAW = os.getenv("ZD_TICKET_GROUP_ID", "").strip()
+    ZD_GROUP_ID = int(ZD_GROUP_ID_RAW) if ZD_GROUP_ID_RAW.isdigit() else None
+
+    SERVICENOW_URL = servicenow_url(os.getenv("SERVICENOW_INSTANCE", ""))
+    SERVICENOW_USER = os.getenv("SERVICENOW_USER", "")
+    SERVICENOW_PASSWORD = os.getenv("SERVICENOW_PASSWORD", "")
+    SERVICENOW_TOKEN = os.getenv("SERVICENOW_TOKEN", "")          # OAuth bearer, instead of a user
+    SERVICENOW_TABLE = os.getenv("SERVICENOW_TABLE", "") or "incident"
+    SERVICENOW_IMPACT = os.getenv("SERVICENOW_IMPACT", "2")
+    SERVICENOW_URGENCY = os.getenv("SERVICENOW_URGENCY", "2")
+    SERVICENOW_ASSIGNMENT_GROUP = os.getenv("SERVICENOW_ASSIGNMENT_GROUP", "")
+    SERVICENOW_CALLER = os.getenv("SERVICENOW_CALLER", "")
+    SERVICENOW_CATEGORY = os.getenv("SERVICENOW_CATEGORY", "")
+    SERVICENOW_RESOLVE = os.getenv("SERVICENOW_RESOLVE", "true").lower() in ("1", "true", "yes")
+    SERVICENOW_RESOLVED_STATE = os.getenv("SERVICENOW_RESOLVED_STATE", "") or "6"
+    SERVICENOW_CLOSE_CODE = os.getenv("SERVICENOW_CLOSE_CODE", "Resolved by caller")
+    SERVICENOW_EXTRA_FIELDS_RAW = os.getenv("SERVICENOW_EXTRA_FIELDS", "")
+
+    PUSHOVER_API_URL = os.getenv("PUSHOVER_API_URL", "https://api.pushover.net/1/messages.json")
+    PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
+    PUSHOVER_USER = os.getenv("PUSHOVER_USER", "")
+    PUSHOVER_PRIORITY = os.getenv("PUSHOVER_PRIORITY", "0")
+
+    PAGERDUTY_EVENTS_URL = os.getenv("PAGERDUTY_EVENTS_URL", "https://events.pagerduty.com/v2/enqueue")
+    PAGERDUTY_ROUTING_KEY = os.getenv("PAGERDUTY_ROUTING_KEY", "")
+    PAGERDUTY_SEVERITY = os.getenv("PAGERDUTY_SEVERITY", "error")
+
+    TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
+
+    SNMP_TRAP_TARGETS = _env_list("SNMP_TRAP_TARGETS")
+    SNMP_COMMUNITY = os.getenv("SNMP_COMMUNITY", "")
+    # Under the experimental arc until you have your own enterprise number. If you
+    # change it, change SKYFARER-MIB.txt to match.
+    SNMP_BASE_OID = (os.getenv("SNMP_BASE_OID", "") or "1.3.6.1.3.77701").rstrip(".")
+
+    WEBHOOKS = _env_webhook() if webhooks is None else list(webhooks)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+configure()
 
 
 class PermanentFailure(Exception):
@@ -436,64 +475,83 @@ def webhook_values(row: dict) -> dict:
     return values
 
 
-def _webhook_headers() -> dict:
-    """WEBHOOK_HEADERS: a JSON object of extra headers, such as an API key.
-    Checked at startup."""
-    if not WEBHOOK_HEADERS_RAW.strip():
+def webhook_headers(hook: Webhook) -> dict:
+    """The webhook's extra headers: a JSON object, such as an API key."""
+    if not hook.headers.strip():
         return {}
-    value = json.loads(WEBHOOK_HEADERS_RAW)
+    value = json.loads(hook.headers)
     if not isinstance(value, dict) or not all(isinstance(v, str) for v in value.values()):
         raise ValueError("not a JSON object of strings")
     return value
 
 
-def webhook_body(row: dict) -> str:
-    """The request body. Without WEBHOOK_TEMPLATE, a JSON document with every
-    field. With one, each {{field}} in the template is replaced by its value:
-    escaped for use inside a JSON string when the content type is JSON (so
-    write "{{title}}" with the quotes), as plain text otherwise."""
+def webhook_body(row: dict, hook: Webhook) -> str:
+    """The request body. Without a template, a JSON document with every field.
+    With one, each {{field}} in the template is replaced by its value: escaped
+    for use inside a JSON string when the content type is JSON (so write
+    "{{title}}" with the quotes), as plain text otherwise."""
     values = webhook_values(row)
-    if not WEBHOOK_TEMPLATE:
+    if not hook.template:
         return json.dumps({"source": "skyfarer", **values})
-    is_json = "json" in WEBHOOK_CONTENT_TYPE
+    is_json = "json" in hook.content_type
 
     def fill(match: re.Match) -> str:
         value = values[match.group(1)]
         if isinstance(value, int) or not is_json:
             return str(value)
         return json.dumps(str(value))[1:-1]
-    return _PLACEHOLDER.sub(fill, WEBHOOK_TEMPLATE)
+    return _PLACEHOLDER.sub(fill, hook.template)
 
 
-def _webhook_template_errors() -> list[str]:
+def webhook_errors(hook: Webhook) -> list[str]:
+    """What's wrong with a webhook's settings, as messages for the person
+    editing it."""
     errors = []
-    unknown = sorted({m.group(1) for m in _PLACEHOLDER.finditer(WEBHOOK_TEMPLATE)}
+    if urlsplit(hook.url).scheme not in ("http", "https") or not urlsplit(hook.url).netloc:
+        errors.append("The URL must start with http:// or https://")
+    if hook.method not in ("POST", "PUT", "PATCH"):
+        errors.append(f"The method must be POST, PUT or PATCH, not {hook.method!r}")
+    unknown = [e for e in hook.events if e not in EVENTS]
+    if unknown:
+        errors.append(f"Events must be from {', '.join(EVENTS)}, not {', '.join(unknown)}")
+    try:
+        webhook_headers(hook)
+    except ValueError as exc:
+        errors.append(f"Extra headers must be a JSON object of strings: {exc}")
+    unknown = sorted({m.group(1) for m in _PLACEHOLDER.finditer(hook.template)}
                      - set(WEBHOOK_FIELDS))
     if unknown:
-        errors.append(f"WEBHOOK_TEMPLATE has unknown placeholders: {', '.join(unknown)} "
+        errors.append(f"The template has unknown fields: {', '.join(unknown)} "
                       f"(known: {', '.join(WEBHOOK_FIELDS)})")
-    elif WEBHOOK_TEMPLATE and "json" in WEBHOOK_CONTENT_TYPE:
+    elif hook.template and "json" in hook.content_type:
         sample = {"id": 1, "incident_id": 1, "event": "opened", "payload": {
             "provider": "AWS", "region": "eu-west-2", "title": 'A "quoted" title',
             "summary": "Line one\nline two", "link": "https://example.com/",
             "published": "", "updated": "", "noticed": ""}}
         try:
-            json.loads(webhook_body(sample))
+            json.loads(webhook_body(sample, hook))
         except ValueError as exc:
-            errors.append(f"WEBHOOK_TEMPLATE doesn't make valid JSON: {exc}")
+            errors.append(f"The template doesn't make valid JSON: {exc}")
     return errors
 
 
+def webhook_for(channel: str) -> Optional[Webhook]:
+    return next((h for h in WEBHOOKS if h.channel == channel), None)
+
+
 def send_webhook(row: dict) -> None:
-    body = webhook_body(row).encode()
-    headers = {"Content-Type": WEBHOOK_CONTENT_TYPE, "User-Agent": "skyfarer",
+    hook = webhook_for(row["channel"])
+    if hook is None:
+        raise PermanentFailure("webhook no longer configured")
+    body = webhook_body(row, hook).encode()
+    headers = {"Content-Type": hook.content_type, "User-Agent": "skyfarer",
                "X-Skyfarer-Event": row["event"],
-               "X-Skyfarer-Incident": str(row["incident_id"]), **_webhook_headers()}
-    if WEBHOOK_SECRET:
+               "X-Skyfarer-Incident": str(row["incident_id"]), **webhook_headers(hook)}
+    if hook.secret:
         # The receiver recomputes this over the raw body to check the sender.
-        digest = hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        digest = hmac.new(hook.secret.encode(), body, hashlib.sha256).hexdigest()
         headers["X-Skyfarer-Signature"] = f"sha256={digest}"
-    _check(_request(WEBHOOK_METHOD, WEBHOOK_URL, data=body, headers=headers))
+    _check(_request(hook.method, hook.url, data=body, headers=headers))
 
 
 # ─── SNMP traps ─────────────────────────────────────────────────────────────
@@ -557,7 +615,6 @@ SENDERS: dict[str, Callable[[dict], object]] = {
     "pagerduty": send_pagerduty,
     "teams": send_teams,
     "snmp": send_snmp,
-    "webhook": send_webhook,
 }
 
 # Ticketing systems keep a record of every incident, old ones and maintenance
@@ -570,8 +627,13 @@ CHANNEL_EVENTS = {
     "pagerduty": ("opened", "resolved"),
     "teams": EVENTS,
     "snmp": EVENTS,
-    "webhook": EVENTS,
 }
+
+
+def sender_for(channel: str) -> Optional[Callable[[dict], object]]:
+    if channel.startswith("webhook-"):
+        return SENDERS.get(channel, send_webhook)
+    return SENDERS.get(channel)
 
 
 def enabled_channels() -> list[str]:
@@ -588,58 +650,50 @@ def enabled_channels() -> list[str]:
         channels.append("teams")
     if SNMP_TRAP_TARGETS:
         channels.append("snmp")
-    if WEBHOOK_URL:
-        channels.append("webhook")
+    channels += [h.channel for h in WEBHOOKS if h.url]
     return channels
 
 
 def config_errors() -> list[str]:
-    """Mistakes to report at startup rather than on the first incident."""
+    """Mistakes to report before they cause a failed delivery."""
     errors = []
     if any((ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN)) and not all(
             (ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN)):
-        errors.append("Zendesk needs ZENDESK_SUBDOMAIN, ZENDESK_EMAIL and ZENDESK_API_TOKEN")
+        errors.append("Zendesk needs a subdomain, an agent email and an API token")
+    if ZD_GROUP_ID_RAW and ZD_GROUP_ID is None:
+        errors.append(f"The Zendesk group ID must be a number, not {ZD_GROUP_ID_RAW!r}")
     sn_auth = SERVICENOW_TOKEN or (SERVICENOW_USER and SERVICENOW_PASSWORD)
     if (SERVICENOW_URL or SERVICENOW_USER or SERVICENOW_PASSWORD or SERVICENOW_TOKEN) and not (
             SERVICENOW_URL and sn_auth):
-        errors.append("ServiceNow needs SERVICENOW_INSTANCE and either SERVICENOW_USER "
-                      "with SERVICENOW_PASSWORD, or SERVICENOW_TOKEN")
-    for name, value in (("SERVICENOW_IMPACT", SERVICENOW_IMPACT),
-                        ("SERVICENOW_URGENCY", SERVICENOW_URGENCY)):
+        errors.append("ServiceNow needs an instance and either a user with a password, "
+                      "or an OAuth token")
+    for name, value in (("ServiceNow impact", SERVICENOW_IMPACT),
+                        ("ServiceNow urgency", SERVICENOW_URGENCY)):
         if value not in ("1", "2", "3"):
-            errors.append(f"{name} must be 1, 2 or 3, got: {value!r}")
+            errors.append(f"{name} must be 1, 2 or 3, not {value!r}")
     try:
         _sn_extra_fields()
     except ValueError as exc:
-        errors.append(f"SERVICENOW_EXTRA_FIELDS must be a JSON object: {exc}")
+        errors.append(f"ServiceNow extra fields must be a JSON object: {exc}")
     if bool(PUSHOVER_TOKEN) != bool(PUSHOVER_USER):
-        errors.append("Pushover needs both PUSHOVER_TOKEN and PUSHOVER_USER")
+        errors.append("Pushover needs both an application token and a user key")
     if PUSHOVER_PRIORITY not in ("-2", "-1", "0", "1", "2"):
-        errors.append(f"PUSHOVER_PRIORITY must be -2 to 2, got: {PUSHOVER_PRIORITY!r}")
+        errors.append(f"Pushover priority must be -2 to 2, not {PUSHOVER_PRIORITY!r}")
     if PAGERDUTY_SEVERITY not in PAGERDUTY_SEVERITIES:
-        errors.append(f"PAGERDUTY_SEVERITY must be one of {', '.join(PAGERDUTY_SEVERITIES)}, "
-                      f"got: {PAGERDUTY_SEVERITY!r}")
+        errors.append(f"PagerDuty severity must be one of {', '.join(PAGERDUTY_SEVERITIES)}, "
+                      f"not {PAGERDUTY_SEVERITY!r}")
     if SNMP_TRAP_TARGETS and not SNMP_COMMUNITY:
-        errors.append("SNMP_TRAP_TARGETS needs SNMP_COMMUNITY")
+        errors.append("SNMP traps need a community")
     for target in SNMP_TRAP_TARGETS:
         try:
             _snmp_target(target)
         except ValueError:
-            errors.append(f"SNMP_TRAP_TARGETS has a bad port: {target!r}")
-    for name, events in (("NOTIFY_EVENTS", NOTIFY_EVENTS), ("WEBHOOK_EVENTS", WEBHOOK_EVENTS)):
-        unknown = [e for e in events if e not in EVENTS]
-        if unknown:
-            errors.append(f"{name} must be from {', '.join(EVENTS)}, got: {', '.join(unknown)}")
-    if WEBHOOK_URL:
-        if urlsplit(WEBHOOK_URL).scheme not in ("http", "https"):
-            errors.append("WEBHOOK_URL must be an http or https URL")
-        if WEBHOOK_METHOD not in ("POST", "PUT", "PATCH"):
-            errors.append(f"WEBHOOK_METHOD must be POST, PUT or PATCH, got: {WEBHOOK_METHOD!r}")
-        try:
-            _webhook_headers()
-        except ValueError as exc:
-            errors.append(f"WEBHOOK_HEADERS must be a JSON object of strings: {exc}")
-        errors += _webhook_template_errors()
+            errors.append(f"An SNMP receiver has a bad port: {target!r}")
+    unknown = [e for e in NOTIFY_EVENTS if e not in EVENTS]
+    if unknown:
+        errors.append(f"Alert events must be from {', '.join(EVENTS)}, not {', '.join(unknown)}")
+    for hook in WEBHOOKS:
+        errors += [f"Webhook {hook.name!r}: {e}" for e in webhook_errors(hook)]
     return errors
 
 
@@ -652,8 +706,9 @@ def enqueue(conn, incident_id: int, event: str, payload: dict, *, alert: bool = 
     if they heard it begin, so a suppressed incident stays silent throughout."""
     for channel in enabled_channels():
         if channel not in TICKET_CHANNELS:
-            wanted = WEBHOOK_EVENTS if channel == "webhook" else NOTIFY_EVENTS
-            if event not in wanted or event not in CHANNEL_EVENTS[channel]:
+            hook = webhook_for(channel)
+            wanted = (hook.events or NOTIFY_EVENTS) if hook else NOTIFY_EVENTS
+            if event not in wanted or event not in CHANNEL_EVENTS.get(channel, EVENTS):
                 continue
             if event == "opened":
                 if not alert:
@@ -688,7 +743,7 @@ def deliver_pending() -> int:
         row["ticket_id"] = row["ticket_id"] or new_tickets.get(row["incident_id"])
         row["ticket_ref"] = row.get("ticket_ref") or new_refs.get(key)
 
-        sender = SENDERS[row["channel"]] if row["channel"] in enabled_channels() else None
+        sender = sender_for(row["channel"]) if row["channel"] in enabled_channels() else None
         try:
             if sender is None:
                 raise PermanentFailure("channel no longer configured")

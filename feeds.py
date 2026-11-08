@@ -43,17 +43,27 @@ def _env_list(name: str) -> list[str]:
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
-AWS_REGIONS = _env_list("AWS_REGIONS")
-OVH_REGIONS = _env_list("OVH_REGIONS")
-AZURE_REGIONS = _env_list("AZURE_REGIONS")
-GCP_REGIONS = _env_list("GCP_REGIONS")
-HETZNER_REGIONS = _env_list("HETZNER_REGIONS")
-FILTER_KEYWORDS = _env_list("FILTER_KEYWORDS")
+def configure() -> None:
+    """Read the settings from the environment. settings.apply() puts the
+    database's values there and calls this before every poll, so a change made
+    in the dashboard applies from the next one."""
+    global AWS_REGIONS, OVH_REGIONS, AZURE_REGIONS, GCP_REGIONS, HETZNER_REGIONS
+    global FILTER_KEYWORDS, OVH_FEED_URL, AZURE_FEED_URL, GCP_INCIDENTS_URL, HETZNER_FEED_URL
+    AWS_REGIONS = _env_list("AWS_REGIONS")
+    OVH_REGIONS = _env_list("OVH_REGIONS")
+    AZURE_REGIONS = _env_list("AZURE_REGIONS")
+    GCP_REGIONS = _env_list("GCP_REGIONS")
+    HETZNER_REGIONS = _env_list("HETZNER_REGIONS")
+    FILTER_KEYWORDS = _env_list("FILTER_KEYWORDS")
 
-OVH_FEED_URL = os.getenv("OVH_FEED_URL", "https://public-cloud.status-ovhcloud.com/history.rss")
-AZURE_FEED_URL = os.getenv("AZURE_FEED_URL", "https://rssfeed.azure.status.microsoft/en-us/status/feed/")
-GCP_INCIDENTS_URL = os.getenv("GCP_INCIDENTS_URL", "https://status.cloud.google.com/incidents.json")
-HETZNER_FEED_URL = os.getenv("HETZNER_FEED_URL", "https://status.hetzner.com/en.atom")
+    # Feed addresses stay in .env: they only change for testing.
+    OVH_FEED_URL = os.getenv("OVH_FEED_URL", "https://public-cloud.status-ovhcloud.com/history.rss")
+    AZURE_FEED_URL = os.getenv("AZURE_FEED_URL", "https://rssfeed.azure.status.microsoft/en-us/status/feed/")
+    GCP_INCIDENTS_URL = os.getenv("GCP_INCIDENTS_URL", "https://status.cloud.google.com/incidents.json")
+    HETZNER_FEED_URL = os.getenv("HETZNER_FEED_URL", "https://status.hetzner.com/en.atom")
+
+
+configure()
 
 AWS_FEED_TEMPLATE = "https://status.aws.amazon.com/rss/multipleservices-{region}.rss"
 AZURE_STATUS_PAGE = "https://azure.status.microsoft/en-us/status/"

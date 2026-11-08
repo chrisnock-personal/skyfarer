@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block page %}
+<main class="auth">
+  <div class="auth-inner">
+    <div class="auth-top">
+      <span class="brand">{{ brand_mark(36) }}<span>Skyfarer</span></span>
+      {{ theme_button() }}
+    </div>
+    {% block card %}{% endblock %}
+  </div>
+</main>
+{% endblock %}

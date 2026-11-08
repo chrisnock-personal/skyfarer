@@ -1,0 +1,249 @@
+{% extends "settings_base.html" %}
+{% block title %}Channels · Skyfarer{% endblock %}
+{% block heading %}
+<div>
+  <h1>Channels</h1>
+  <p class="lede">Where incidents go. Ticket channels open a ticket and follow it to the end; alert channels tell people. Changes apply from the poller's next poll.</p>
+</div>
+{% endblock %}
+
+{% macro secret_field(key, label, stored, help='', wide=false) %}
+<div class="field {{ 'wide' if wide }}">
+  <span class="label" id="lbl-{{ key }}">{{ label }}</span>
+  {% if stored %}
+  <details class="replace">
+    <summary aria-label="{{ label }}: stored, {{ stored }}. Replace or remove">
+      <div class="stored"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--good)" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="flex: none"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span><strong>Stored</strong> · {{ stored }}</span><span class="btn small" style="flex: none">Replace</span></div>
+    </summary>
+    <div class="new">
+      {% if wide %}
+      <textarea class="input" name="{{ key }}" aria-labelledby="lbl-{{ key }}" placeholder="Paste the new value"></textarea>
+      {% else %}
+      <input class="input" type="password" name="{{ key }}" autocomplete="off" aria-labelledby="lbl-{{ key }}" placeholder="Paste the new value">
+      {% endif %}
+      <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center">
+        <label class="check"><input type="checkbox" name="remove_{{ key }}" value="1"> Remove it</label>
+        <button type="button" class="btn small" onclick="var d=this.closest('details'); d.querySelectorAll('input,textarea').forEach(function(i){ if (i.type==='checkbox') i.checked=false; else i.value=''; }); d.open=false;">Keep current</button>
+      </div>
+    </div>
+  </details>
+  {% elif wide %}
+  <textarea class="input" name="{{ key }}" aria-labelledby="lbl-{{ key }}" placeholder="Not set"></textarea>
+  {% else %}
+  <input class="input" type="password" name="{{ key }}" autocomplete="off" aria-labelledby="lbl-{{ key }}" placeholder="Not set">
+  {% endif %}
+  {% if help %}<span class="help">{{ help }}</span>{% endif %}
+</div>
+{% endmacro %}
+
+{% macro test_result(channel) %}
+  {% for category, message in get_flashed_messages(with_categories=true) %}
+    {% if category == 'test:' ~ channel ~ ':ok' %}<div class="flash ok" role="status">{{ message }}</div>
+    {% elif category == 'test:' ~ channel ~ ':bad' %}<div class="flash bad" role="status">{{ message }}</div>{% endif %}
+  {% endfor %}
+{% endmacro %}
+
+{% macro error_list() %}
+  {% if errors %}<div class="flash bad" role="alert"><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}
+{% endmacro %}
+
+{% macro card_head(id, name, summary, detail, status, tone, on, toggle_url, is_open) %}
+<div class="row-head">
+  <div class="title">
+    <strong>{{ name }}</strong>
+    <span>{{ summary }}{% if detail %} · {{ detail }}{% endif %}</span>
+  </div>
+  <span class="badge {{ tone }}">{{ status }}</span>
+  <form class="inline" method="post" action="{{ toggle_url }}">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <button type="submit" class="switch" aria-pressed="{{ 'true' if on else 'false' }}" aria-label="{{ 'Turn off' if on else 'Turn on' }} {{ name }}"></button>
+  </form>
+  {% if is_open %}
+  <a class="btn" href="{{ url_for('admin.channels') }}#ch-{{ id }}">Close</a>
+  {% else %}
+  <a class="btn" href="{{ url_for('admin.channels', open=id) }}#ch-{{ id }}">Edit</a>
+  {% endif %}
+</div>
+{% endmacro %}
+
+{% macro hook_fields(h, prefix) %}
+<div class="form-grid">
+  <div class="field">
+    <label for="{{ prefix }}-name">Name</label>
+    <input class="input" id="{{ prefix }}-name" name="name" value="{{ h.name }}" placeholder="Slack #cloud-status" required>
+  </div>
+  <div class="field">
+    <label for="{{ prefix }}-method">Method</label>
+    <select id="{{ prefix }}-method" name="method">
+      {% for m in ('POST', 'PUT', 'PATCH') %}<option {% if h.method == m %}selected{% endif %}>{{ m }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field wide">
+    <label for="{{ prefix }}-url">URL</label>
+    <input class="input" id="{{ prefix }}-url" name="url" value="{{ h.url }}" placeholder="https://" required>
+  </div>
+  <fieldset class="field">
+    <legend>Send when an incident</legend>
+    {% for e, text in (('opened', 'Opens'), ('updated', 'Gets an update'), ('resolved', 'Ends')) %}
+    <label class="check"><input type="checkbox" name="events" value="{{ e }}" {% if e in h.events %}checked{% endif %}> {{ text }}</label>
+    {% endfor %}
+    <span class="help">None ticked: follow the alert rules.</span>
+  </fieldset>
+  <div class="field">
+    <label for="{{ prefix }}-ct">Content type</label>
+    <input class="input" id="{{ prefix }}-ct" name="content_type" value="{{ h.content_type or 'application/json' }}">
+  </div>
+  {{ secret_field('secret', 'Signing secret', h.secret_stored, 'Signs each body with HMAC-SHA256, in the X-Skyfarer-Signature header.') }}
+  {{ secret_field('headers', 'Extra headers (JSON)', h.headers_stored, 'Such as {"Authorization": "Bearer …"}. Stored like a password, as headers often hold keys.', wide=true) }}
+  <div class="field wide">
+    <label for="{{ prefix }}-tpl">Body template</label>
+    <textarea class="input" id="{{ prefix }}-tpl" name="template" placeholder='{"text": "{{ '{{' }}event{{ '}}' }}: [{{ '{{' }}provider{{ '}}' }}] {{ '{{' }}title{{ '}}' }} {{ '{{' }}link{{ '}}' }}"}'>{{ h.template }}</textarea>
+    <span class="help">Empty sends every field as JSON. Fields: {{ fields_known }}. Checked when you save.</span>
+  </div>
+</div>
+{% endmacro %}
+
+{% block content %}
+{% if errors and not open_id %}{{ error_list() }}{% endif %}
+
+<form class="card pad" method="post" action="{{ url_for('admin.rules') }}" aria-labelledby="rules-h">
+  <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+  <div>
+    <h2 id="rules-h">Alert rules</h2>
+    <p class="hint">For alert channels and webhooks. Ticket channels always get every event, so a ticket has the whole story.</p>
+  </div>
+  <div class="form-grid">
+    <fieldset class="field">
+      <legend>Send when an incident</legend>
+      {% for e, text in (('opened', 'Opens'), ('updated', 'Gets an update'), ('resolved', 'Ends')) %}
+      <label class="check"><input type="checkbox" name="events" value="{{ e }}" {% if e in rules.events %}checked{% endif %}> {{ text }}</label>
+      {% endfor %}
+    </fieldset>
+    <div class="field">
+      <label for="age">Skip events older than (hours)</label>
+      <input class="input short" id="age" name="NOTIFY_MAX_AGE_HOURS" inputmode="decimal" value="{{ rules.max_age }}">
+      <span class="help">So a first start doesn't page anyone about last week.</span>
+    </div>
+    <div class="field">
+      <label for="retry">Keep retrying a failed notice for (hours)</label>
+      <input class="input short" id="retry" name="NOTIFY_RETRY_HOURS" inputmode="decimal" value="{{ rules.retry }}">
+    </div>
+    <fieldset class="field">
+      <legend>Planned maintenance</legend>
+      <label class="check"><input type="checkbox" name="NOTIFY_MAINTENANCE" value="true" {% if rules.maintenance %}checked{% endif %}> Alert on maintenance too</label>
+    </fieldset>
+  </div>
+  <div class="actions"><span></span><button type="submit" class="btn primary">Save rules</button></div>
+</form>
+
+{% for g in groups %}
+<section style="display: flex; flex-direction: column; gap: 12px" aria-labelledby="grp-{{ g.id }}">
+  <div class="group-head">
+    <h2 id="grp-{{ g.id }}">{{ g.title }}</h2>
+    <span class="hint">{{ g.blurb }}</span>
+  </div>
+  {% for c in g.cards %}
+  {% set is_open = open_id == c.id %}
+  <section class="card channel-card {{ 'open' if is_open }}" id="ch-{{ c.id }}" aria-label="{{ c.name }}">
+    {{ card_head(c.id, c.name, c.summary, c.detail, c.status, c.tone, c.on, url_for('admin.channel_toggle', cid=c.id), is_open) }}
+    {% if is_open %}
+    <form class="editor" method="post" action="{{ url_for('admin.channel_save', cid=c.id) }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      {{ error_list() }}
+      <div class="form-grid">
+        {% for x in c.fields %}
+          {% set f = x.f %}
+          {% if f.kind == 'secret' %}
+            {{ secret_field(f.key, f.label, x.stored, f.help) }}
+          {% elif f.kind == 'bool' %}
+            <fieldset class="field">
+              <legend>{{ f.label }}</legend>
+              <label class="check"><input type="checkbox" name="{{ f.key }}" value="true" {% if x.checked %}checked{% endif %}> Yes</label>
+              {% if f.help %}<span class="help">{{ f.help }}</span>{% endif %}
+            </fieldset>
+          {% else %}
+            <div class="field {{ 'wide' if f.wide }}">
+              <label for="f-{{ f.key }}">{{ f.label }}</label>
+              {% if f.kind == 'select' %}
+                <select id="f-{{ f.key }}" name="{{ f.key }}">
+                  {% for value, text in f.options %}<option value="{{ value }}" {% if value == x.value %}selected{% endif %}>{{ text }}</option>{% endfor %}
+                </select>
+              {% elif f.kind == 'json' %}
+                <textarea class="input" id="f-{{ f.key }}" name="{{ f.key }}">{{ x.value }}</textarea>
+              {% else %}
+                <input class="input" id="f-{{ f.key }}" name="{{ f.key }}" value="{{ x.value }}">
+              {% endif %}
+              {% if f.help %}<span class="help">{{ f.help }}</span>{% endif %}
+            </div>
+          {% endif %}
+        {% endfor %}
+      </div>
+      {{ test_result(c.id) }}
+      <div class="actions">
+        <button type="submit" class="btn" formaction="{{ url_for('admin.channel_test', cid=c.id) }}" formnovalidate>{{ 'Raise a test ticket' if g.id == 'tickets' else 'Send a test' }}</button>
+        <div class="end">
+          <a class="btn" href="{{ url_for('admin.channels') }}#ch-{{ c.id }}">Cancel</a>
+          <button type="submit" class="btn primary">Save</button>
+        </div>
+      </div>
+      <p class="hint">A test uses the saved settings, so save first.</p>
+    </form>
+    {% endif %}
+  </section>
+  {% endfor %}
+</section>
+{% endfor %}
+
+<section style="display: flex; flex-direction: column; gap: 12px" aria-labelledby="grp-hooks">
+  <div class="group-head">
+    <h2 id="grp-hooks">Webhooks</h2>
+    <span class="hint">As many as you need, each with its own URL, events, body and signing secret.</span>
+  </div>
+  {% for h in hooks %}
+  {% set is_open = open_id == h.channel %}
+  <section class="card channel-card {{ 'open' if is_open }}" id="ch-{{ h.channel }}" aria-label="Webhook {{ h.name }}">
+    {{ card_head(h.channel, h.name, h.summary, h.detail, h.status, h.tone, h.on, url_for('admin.webhook_toggle', hook_id=h.id), is_open) }}
+    {% if is_open %}
+    <form class="editor" method="post" action="{{ url_for('admin.webhook_save', hook_id=h.id) }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      {{ error_list() }}
+      {{ hook_fields(h, h.channel) }}
+      {{ test_result(h.channel) }}
+      <div class="actions">
+        <div class="end">
+          <button type="submit" class="btn" formaction="{{ url_for('admin.webhook_test', hook_id=h.id) }}" formnovalidate>Send a test</button>
+          <button type="submit" class="btn danger" formaction="{{ url_for('admin.webhook_delete', hook_id=h.id) }}" formnovalidate>Delete</button>
+        </div>
+        <div class="end">
+          <a class="btn" href="{{ url_for('admin.channels') }}#ch-{{ h.channel }}">Cancel</a>
+          <button type="submit" class="btn primary">Save</button>
+        </div>
+      </div>
+      <p class="hint">A test uses the saved settings, so save first.</p>
+    </form>
+    {% endif %}
+  </section>
+  {% endfor %}
+
+  {% if open_id == 'new' %}
+  <section class="card channel-card open" id="ch-new" aria-labelledby="new-h">
+    <div class="row-head"><div class="title"><strong id="new-h">New webhook</strong><span>Switched on as soon as it's added.</span></div></div>
+    <form class="editor" method="post" action="{{ url_for('admin.webhook_new') }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      {{ error_list() }}
+      {% set blank = {'name': new_hook.get('name', '') if new_hook else '', 'url': new_hook.get('url', '') if new_hook else '', 'method': new_hook.get('method', 'POST') if new_hook else 'POST', 'events': new_hook.getlist('events') if new_hook else [], 'content_type': new_hook.get('content_type', '') if new_hook else '', 'template': new_hook.get('template', '') if new_hook else '', 'secret_stored': none, 'headers_stored': none} %}
+      {{ hook_fields(blank, 'new') }}
+      <div class="actions">
+        <span></span>
+        <div class="end">
+          <a class="btn" href="{{ url_for('admin.channels') }}">Cancel</a>
+          <button type="submit" class="btn primary">Add webhook</button>
+        </div>
+      </div>
+    </form>
+  </section>
+  {% else %}
+  <a class="btn dashed" style="align-self: flex-start" href="{{ url_for('admin.channels', open='new') }}#ch-new">+ Add a webhook</a>
+  {% endif %}
+</section>
+{% endblock %}

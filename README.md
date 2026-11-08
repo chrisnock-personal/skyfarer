@@ -9,20 +9,25 @@
 pages of AWS, Azure, Google Cloud, OVHcloud, DigitalOcean, Hetzner, Linode,
 Cloudflare and Scaleway for incidents and maintenance in the regions you care
 about. It raises Zendesk tickets or ServiceNow incidents and sends Pushover,
-PagerDuty, Microsoft Teams
-and SNMP trap notifications, then follows up when the provider marks the
-incident clear.
+PagerDuty, Microsoft Teams, SNMP trap and webhook notifications, then follows
+up when the provider marks the incident clear.
 
-All incident state is held in **Postgres** -no local JSON files.  The whole stack runs in Docker Compose.
+Providers, regions, channels and their keys are set in the dashboard, by
+admins; viewers see the dashboard only. Everything is held in **Postgres**,
+and the whole stack runs in Docker Compose.
 
 
 ## Quick start
 
 ```bash
-cp .env.example .env         # fill in your regions and notification channels
-docker compose up -d          # builds the poller image, starts Postgres
-docker compose logs -f poller # watch it work
+cp .env.example .env         # set SKYFARER_SECRET_KEY; regions and channels optional
+docker compose up -d          # builds the image, starts Postgres, the poller and the dashboard
+docker compose logs dashboard # shows the one-time setup code
 ```
+
+Then open `http://127.0.0.1:8080`, enter the setup code and create the first
+admin account. Whatever regions and channels `.env` had are imported on that
+first start; from then on they're changed in the dashboard, under Settings.
 
 To tear it down (data is preserved in the `pgdata` volume):
 
@@ -44,7 +49,7 @@ docker compose down
 │  │             │   │    └──────────────────────────┘        │
 │  │  incidents  │   │    ┌──────────────────────────┐        │
 │  │  poll_log   │   └───►│  dashboard                 │        │
-│  └────────────┘        │  read-only web UI            │        │
+│  └────────────┘        │  web UI and settings         │        │
 │                         └──────────────────────────┘        │
 └───────────────────────────────────────────────────────────┘
          ▲                              ▲
@@ -54,8 +59,8 @@ docker compose down
 
 ## Dashboard
 
-A read-only web dashboard is available at `http://127.0.0.1:8080` once the
-stack is up. It opens in dark mode; the button at the top right switches to
+The dashboard is at `http://127.0.0.1:8080` once the stack is up, for everyone
+with an account. It opens in dark mode; the button at the top right switches to
 light, and the browser remembers the choice. It shows:
 
 - Summary tiles: open incidents and which providers they're on, maintenance
@@ -77,8 +82,55 @@ light, and the browser remembers the choice. It shows:
   from–to date range), applied to the incidents, notifications and poll_log
   tables
 
-It only issues `SELECT` queries -no notifications, no config changes, no
-write access. The page auto-refreshes every 30 seconds.
+The page auto-refreshes every 30 seconds. Admins also see **Settings**.
+
+## Settings and accounts
+
+Only three things stay in `.env`: `SKYFARER_SECRET_KEY`, the Postgres
+connection and the dashboard's address (plus the feed URLs, which only change
+for testing). Everything else is kept in the database and changed in the
+dashboard:
+
+- **Providers and regions.** Each provider can be switched on or off without
+  losing its regions. Regions are added as tags, with suggestions of common
+  codes, and there's the keyword filter and the poll interval.
+- **Channels.** The alert rules (which events, how old is too old, how long to
+  retry, maintenance), then Zendesk, ServiceNow, Pushover, PagerDuty, Teams and
+  SNMP, each with its own switch, editor and test button. A test uses the saved
+  settings: a ServiceNow test creates a record and resolves it, a Zendesk test
+  opens a ticket and sets it to pending.
+- **Webhooks.** Any number, each with its own URL, method, events, template,
+  headers and signing secret.
+- **Users and access.** Admins see and change everything; viewers see the
+  dashboard and nothing under Settings. There's always at least one admin, and
+  nobody can change their own role.
+
+**How changes take effect.** The poller reloads the settings at the start of
+every poll, so a change applies within one poll interval, without a restart.
+Settings are checked when they're saved: a template with an unknown field,
+extra fields that aren't JSON, or a channel left half set up is refused with a
+message, and nothing is saved.
+
+**Secrets.** Keys, passwords, tokens, Teams' workflow URL and webhook headers
+are encrypted in the database with a key derived from `SKYFARER_SECRET_KEY`.
+Once saved they can't be read back through the dashboard: it shows when and by
+whom each was set, and offers to replace or remove it. Keep the secret key with
+your backups: without it, the stored secrets can't be decrypted and have to be
+entered again.
+
+**Accounts.** On the first visit with no accounts, the dashboard asks for a
+setup code that it prints to its own log, so whoever reaches the page first
+can't take the admin account. Further people are added by an admin, who gets a
+one-time setup link to pass on (Skyfarer sends no email); it expires after 24
+hours. The same is how a forgotten password is reset. Passwords are hashed
+(scrypt); after five wrong attempts for one email from one address, that pair
+waits 15 minutes.
+Sessions last 12 hours. Behind an HTTPS proxy, set `DASHBOARD_HTTPS=true` so
+the session cookie is only sent over HTTPS.
+
+**Change history.** Every change is recorded with who made it and when,
+including switches, regions added and removed, and users added or removed.
+Secret changes are recorded as "replaced" or "removed", never with the value.
 
 ## Database schema
 
@@ -158,6 +210,12 @@ The delivery queue: one row per notice per channel. See
 | next_attempt_at | timestamptz | earliest next try |
 | sent_at | timestamptz | when it was delivered |
 
+### `settings`, `webhooks`, `users`, `settings_log`
+
+The dashboard's settings (keyed by their `.env` names, secrets encrypted),
+the webhooks, the accounts (password hashes, and setup links as SHA-256 hashes)
+and the change history. See [Settings and accounts](#settings-and-accounts).
+
 ### `poll_log`
 
 One row per poll cycle -useful for spotting gaps or failures.
@@ -233,9 +291,10 @@ that name no watched region are logged, as are entries with no parseable date.
 
 ## Notifications
 
-Seven channels, each on once its settings in `.env` are filled in. At least one
-is needed, and any can run alone. Zendesk and ServiceNow are the ticketing
-channels; the rest alert people and systems.
+Six channels plus any number of webhooks, each set up under Settings >
+Channels (or in `.env` before the first start). Any can run alone. Zendesk and
+ServiceNow are the ticketing channels; the rest alert people and systems. The
+settings column gives each setting's name in `.env` and in the database.
 
 | Channel | What it sends | Settings |
 |---------|---------------|----------|
@@ -245,7 +304,7 @@ channels; the rest alert people and systems.
 | PagerDuty | An Events API v2 alert, resolved automatically when the incident ends | `PAGERDUTY_ROUTING_KEY`, `PAGERDUTY_SEVERITY` |
 | Microsoft Teams | An Adaptive Card, posted to a Workflows webhook | `TEAMS_WEBHOOK_URL` |
 | SNMP traps | A v2c trap to each receiver, defined in `SKYFARER-MIB.txt` | `SNMP_TRAP_TARGETS`, `SNMP_COMMUNITY`, `SNMP_BASE_OID` |
-| Webhook | A request to any URL, with a JSON document or a body of your own | `WEBHOOK_*` |
+| Webhooks | A request to any URL, with a JSON document or a body of your own | One per webhook, under Settings; `WEBHOOK_*` in `.env` describes the first |
 
 **What reaches the channels that interrupt people.** Zendesk and ServiceNow
 record every incident. The other channels skip incidents published more than
@@ -281,8 +340,10 @@ provider says it's over, the record moves to Resolved (state 6) with
 it later; `SERVICENOW_RESOLVE=false` only adds a work note and leaves it for a
 person. The close code must be one your instance accepts.
 
-**Webhook.** For anything else: a chat tool, an on-call service, an automation
-platform or your own system. By default it sends a JSON document:
+**Webhooks.** For anything else: a chat tool, an on-call service, an automation
+platform or your own system, as many as you need. Each sends its own requests,
+retries alone and has its own row in the dashboard's delivery health. By
+default a webhook sends a JSON document:
 
 ```json
 {"source": "skyfarer", "event": "opened", "incident_id": 42, "provider": "DigitalOcean",
@@ -293,20 +354,20 @@ platform or your own system. By default it sends a JSON document:
 
 `incident_id` is the same on an incident's `opened` and `resolved` notices, so
 the receiver can pair them; the `X-Skyfarer-Event` and `X-Skyfarer-Incident`
-headers carry both too. `WEBHOOK_TEMPLATE` replaces the body with your own,
+headers carry both too. A body template replaces the document with your own,
 filling in `{{field}}` placeholders; with a JSON content type, each value is
 escaped for use inside a JSON string, so a Slack-style message is:
 
 ```
-WEBHOOK_TEMPLATE={"text": "{{event}}: [{{provider}}] {{region}} {{title}} {{link}}"}
+{"text": "{{event}}: [{{provider}}] {{region}} {{title}} {{link}}"}
 ```
 
-A template is checked at startup: an unknown placeholder, or one that wouldn't
-make valid JSON, stops Skyfarer with a message. `WEBHOOK_HEADERS` adds headers
-such as an API key, and `WEBHOOK_SECRET` signs each request with
+A template is checked when it's saved: an unknown placeholder, or one that
+wouldn't make valid JSON, is refused with a message. Extra headers (a JSON
+object) can carry an API key, and a signing secret signs each request with
 `X-Skyfarer-Signature: sha256=<HMAC-SHA256 of the body>`, so the receiver can
-check it came from Skyfarer. `WEBHOOK_EVENTS` picks its events separately from
-the other alert channels.
+check it came from Skyfarer. Each webhook can pick its own events; with none
+ticked, it follows the alert rules.
 
 Failures show on the dashboard. Retries run once per poll cycle, so a retry
 can't happen more often than `POLL_INTERVAL_SECONDS`. An SNMP trap is one UDP
@@ -363,8 +424,8 @@ database at all:
    category and text; many Hetzner notices name no location, so add the
    categories `Network` or `General`, or `*`, to catch those.
 
-   `*` watches everything a provider publishes. Leave a setting blank to turn
-   that provider off.
+   `*` watches everything a provider publishes. A provider with no regions, or
+   switched off under Settings, isn't read at all.
 2. **Keywords** (`FILTER_KEYWORDS`, optional) -a comma-separated list of
    words. If set, an entry must also contain at least one of these
    (case-insensitive, matched against title + summary) to be ingested.
@@ -377,8 +438,8 @@ database at all:
 
 Entries that don't pass are skipped before any database write or
 notification -they never appear in `incidents`, `poll_log`'s `entries_seen` count,
-or the dashboard. This runs on every poll cycle, so changing `FILTER_KEYWORDS`
-in `.env` takes effect the next time the poller restarts.
+or the dashboard. Both are set under Settings > Providers and regions, and a
+change applies from the next poll.
 
 ## Running outside Docker
 
@@ -409,10 +470,15 @@ python -m unittest discover tests
 ```
 
 Covers each channel's payload against its published limits, which failures
-retry, what gets queued for which channel, delivery order, and startup checks,
+retry, what gets queued for which channel, delivery order, and settings checks,
 plus region matching and parsing for the Statuspage and Hetzner feeds (from
-trimmed copies of real payloads). They need no database or network.
+trimmed copies of real payloads), and how stored settings reach the poller,
+switches, secret encryption and the change history's wording. They need no
+database or network.
 
 ## .env reference
 
-See `.env.example` for the full list with comments.
+See `.env.example` for the full list with comments. Apart from
+`SKYFARER_SECRET_KEY`, Postgres, the dashboard's address and the feed URLs,
+those settings are read once, on the first start, and imported into the
+database; after that, change them in the dashboard.

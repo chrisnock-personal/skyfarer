@@ -36,9 +36,8 @@ load_dotenv()
 import db  # noqa: E402
 import feeds  # noqa: E402
 import notifiers  # noqa: E402
+import settings  # noqa: E402
 from feeds import FeedEntry, fmt_dt  # noqa: E402
-
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 
 # Providers whose feed has no stable ID for one event (see _process_grouped).
 GROUPED_PROVIDERS = ("AWS", "Azure")
@@ -57,23 +56,26 @@ def _now_utc() -> str:
 
 # ─── Preflight ──────────────────────────────────────────────────────────────
 
+def poll_interval() -> int:
+    try:
+        return max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "") or 300))
+    except ValueError:
+        return 300
+
+
 def preflight(dry_run: bool = False) -> bool:
+    """Report what's missing or wrong. Settings are edited in the dashboard,
+    so these are warnings: the poller keeps running and picks up the fix."""
     ok = True
     for error in notifiers.config_errors():
         log.error(error); ok = False
     if not dry_run and not notifiers.enabled_channels():
-        log.error("No notification channel configured: set up at least one of "
-                  "Zendesk, ServiceNow, Pushover, PagerDuty, Teams, SNMP traps or a webhook"); ok = False
+        log.warning("No notification channel is set up: add one in the dashboard, "
+                    "under Settings > Channels"); ok = False
     if not any(feeds.watched_regions().values()):
-        log.error("No regions configured: set at least one of %s",
-                  ", ".join(_region_settings())); ok = False
+        log.warning("No regions are being watched: add some in the dashboard, "
+                    "under Settings > Providers and regions"); ok = False
     return ok
-
-
-def _region_settings() -> list[str]:
-    names = ["AWS_REGIONS", "AZURE_REGIONS", "GCP_REGIONS", "OVH_REGIONS"]
-    names += [f"{p.env}_REGIONS" for p in feeds.STATUSPAGE_PROVIDERS]
-    return names + ["HETZNER_REGIONS"]
 
 
 # ─── Incident lifecycle ─────────────────────────────────────────────────────
@@ -345,31 +347,48 @@ def main() -> None:
     if dry_run:
         log.info("DRY-RUN mode – no notifications will be sent")
 
-    if args.init_db:
-        db.init_schema()
-        log.info("Database ready")
-        return
-
-    if not preflight(dry_run=dry_run):
+    problem = settings.secret_key_problem()
+    if problem:
+        log.error(problem)
         sys.exit(1)
 
     db.init_schema()  # idempotent – safe on every start
+    if args.init_db:
+        log.info("Database ready")
+        return
+    settings.bootstrap()   # imports .env on the very first start
+    settings.apply()
+    preflight(dry_run=dry_run)
 
     if run_once:
         poll_once(dry_run=dry_run)
         return
 
     watching = {p: r for p, r in feeds.watched_regions().items() if r}
-    log.info("Watching: %s", "; ".join(f"{p} ({', '.join(r)})" for p, r in watching.items()))
+    log.info("Watching: %s", "; ".join(f"{p} ({', '.join(r)})" for p, r in watching.items())
+             or "nothing yet")
     log.info("Notification channels: %s", ", ".join(notifiers.enabled_channels()) or "none")
-    log.info("Starting continuous poll loop (every %ds)", POLL_INTERVAL)
+    log.info("Starting continuous poll loop (every %ds)", poll_interval())
+    first = True
     while True:
         try:
+            if not first:
+                # Changes made in the dashboard since the last poll.
+                before = _snapshot()
+                settings.apply()
+                if _snapshot() != before:
+                    log.info("Settings changed in the dashboard")
+                    preflight(dry_run=dry_run)
+            first = False
             poll_once(dry_run=dry_run)
         except Exception:
             log.exception("Unhandled error during poll cycle")
-        time.sleep(POLL_INTERVAL)
+        time.sleep(poll_interval())
 
+
+def _snapshot() -> tuple:
+    return (tuple(sorted((k, os.getenv(k, "")) for k in settings.MANAGED)),
+            tuple(repr(h) for h in notifiers.WEBHOOKS))
 
 if __name__ == "__main__":
     main()

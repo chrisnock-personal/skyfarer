@@ -1,0 +1,30 @@
+{% extends "auth_base.html" %}
+{% block title %}Welcome · Skyfarer{% endblock %}
+{% block card %}
+{% if expired %}
+<div class="card pad">
+  <h1>This link has expired</h1>
+  <p class="hint">Setup links work once and only for 24 hours. Ask an admin for a new one.</p>
+</div>
+{% else %}
+<form class="card" method="post">
+  <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+  <div>
+    <h1>Welcome, {{ person.name }}</h1>
+    <p>Choose a password for {{ person.email }}. You'll sign in with it from now on.</p>
+  </div>
+  {% if error %}<div class="flash bad" role="alert">{{ error }}</div>{% endif %}
+  <input type="hidden" name="username" autocomplete="username" value="{{ person.email }}">
+  <div class="field">
+    <label for="password">Password</label>
+    <input class="input" id="password" name="password" type="password" autocomplete="new-password" minlength="12" required autofocus>
+    <span class="help">At least 12 characters.</span>
+  </div>
+  <div class="field">
+    <label for="confirm">Password again</label>
+    <input class="input" id="confirm" name="confirm" type="password" autocomplete="new-password" required>
+  </div>
+  <button type="submit" class="btn primary">Save password and sign in</button>
+</form>
+{% endif %}
+{% endblock %}
