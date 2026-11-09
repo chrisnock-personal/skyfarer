@@ -144,6 +144,18 @@ CHANNELS = (
         Field("SERVICENOW_EXTRA_FIELDS", "Extra fields (JSON)", "json", wide=True,
               help='Added to every new record, such as {"u_source": "Skyfarer"}.'),
     )),
+    Channel("jsm", "Jira Service Management", "tickets", (
+        Field("JSM_SITE", "Site", help="The part before .atlassian.net, or the full URL."),
+        Field("JSM_EMAIL", "Account email", help="The Atlassian account the API token belongs to: an agent on the service desk."),
+        Field("JSM_API_TOKEN", "API token", "secret", help="From id.atlassian.com, under Security."),
+        Field("JSM_PROJECT", "Project key", help="The service project's key, such as ITSM."),
+        Field("JSM_REQUEST_TYPE", "Request type", help="Its name, such as Report a system problem. Empty: the project's first."),
+        Field("JSM_RESOLVE", "Resolve the request when the incident ends", "bool", default="true"),
+        Field("JSM_TRANSITION", "Resolve with the transition", default="Resolve",
+              help="Its name or ID in your workflow. Part of a name will do."),
+        Field("JSM_EXTRA_FIELDS", "Extra fields (JSON)", "json", wide=True,
+              help='Added to every new request, such as {"priority": {"name": "High"}}.'),
+    )),
     Channel("pushover", "Pushover", "alerts", (
         Field("PUSHOVER_TOKEN", "Application token", "secret"),
         Field("PUSHOVER_USER", "User or group key", "secret"),
@@ -522,7 +534,7 @@ def import_summary(found: dict[str, str], webhook: bool) -> str:
     regions = sum(len(split_list(found[p.key])) for p in providers)
     channels = [c.name for c in CHANNELS if any(found.get(f.key) for f in c.fields
                                                  if f.kind == "secret" or f.key.endswith(
-                                                     ("_SUBDOMAIN", "_INSTANCE", "_TARGETS")))]
+                                                     ("_SUBDOMAIN", "_INSTANCE", "_SITE", "_TARGETS")))]
     if webhook:
         channels.append("a webhook")
     if not providers and not channels:

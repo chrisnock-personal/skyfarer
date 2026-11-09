@@ -53,7 +53,8 @@ STATE_LABELS = [("open", "Active"), ("resolved", "Resolved"), ("all", "All")]
 # How each provider is shown; the database keeps the short names.
 PROVIDER_LABELS = {"GCP": "Google Cloud", "OVH": "OVHcloud"}
 CHANNEL_LABELS = {
-    "zendesk": "Zendesk", "servicenow": "ServiceNow", "pushover": "Pushover", "pagerduty": "PagerDuty",
+    "zendesk": "Zendesk", "servicenow": "ServiceNow", "jsm": "Jira Service Management",
+    "pushover": "Pushover", "pagerduty": "PagerDuty",
     "teams": "Microsoft Teams", "snmp": "SNMP traps", "webhook": "Webhook",
 }
 
@@ -337,6 +338,9 @@ def _tickets(row) -> list[dict]:
             "url": (f"https://{zendesk}.zendesk.com/agent/tickets/{row['ticket_id']}"
                     if zendesk else None)})
     for t in row.get("other_tickets") or []:
+        if t["system"] == "jsm":
+            tickets.append({"label": t["number"] or t["ref"],
+                            "url": f"{notifiers.JSM_URL}/browse/{t['ref']}" if notifiers.JSM_URL else None})
         if t["system"] == "servicenow":
             tickets.append({
                 "label": t["number"] or t["ref"][:8],

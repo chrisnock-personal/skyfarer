@@ -228,6 +228,133 @@ class ServiceNow(unittest.TestCase):
         self.assertEqual(notifiers.servicenow_url(""), "")
 
 
+class JiraServiceManagement(unittest.TestCase):
+    DESKS = {"values": [{"id": "1", "projectKey": "HR"}, {"id": "4", "projectKey": "ISTM"}]}
+    TYPES = {"values": [{"id": "10", "name": "Get IT help"},
+                        {"id": "12", "name": "Report a system problem"}]}
+    # As Jira's issue API lists them for a new ITSM request.
+    TRANSITIONS = {"transitions": [{"id": "51", "name": "Pending"}, {"id": "101", "name": "Cancel"},
+                                   {"id": "111", "name": "Resolve this issue"}]}
+
+    def setUp(self):
+        settings = {"JSM_URL": "https://acme.atlassian.net", "JSM_EMAIL": "bot@example.test",
+                    "JSM_API_TOKEN": "tok", "JSM_PROJECT": "ISTM",
+                    "JSM_REQUEST_TYPE": "system problem", "JSM_TRANSITION": "Resolve",
+                    "JSM_RESOLVE": True, "JSM_EXTRA_FIELDS_RAW": ""}
+        for name, value in settings.items():
+            p = mock.patch.object(notifiers, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        notifiers._jsm_ids.clear()
+
+    def fake(self, *responses):
+        """_request answering GETs from the lookups above and POSTs in order."""
+        posts = list(responses)
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if method == "GET":
+                if url.endswith("/servicedesk?limit=100"):
+                    return response(200, json.dumps(self.DESKS).encode())
+                if "/requesttype" in url:
+                    return response(200, json.dumps(self.TYPES).encode())
+                return response(200, json.dumps(self.TRANSITIONS).encode())
+            return posts.pop(0)
+        return calls, mock.patch.object(notifiers, "_request", side_effect=request)
+
+    def test_site_name_or_url(self):
+        self.assertEqual(notifiers.jsm_url("acme"), "https://acme.atlassian.net")
+        self.assertEqual(notifiers.jsm_url("https://jira.example.test/"), "https://jira.example.test")
+
+    def test_opens_a_request_in_the_right_desk_and_type(self):
+        calls, p = self.fake(response(201, b'{"issueKey": "ISTM-7"}'))
+        with p:
+            result = notifiers.send_jsm(row())
+        self.assertEqual(result, {"ref": "ISTM-7", "number": "ISTM-7"})
+        method, url, kwargs = calls[-1]
+        self.assertEqual((method, url), ("POST", "https://acme.atlassian.net/rest/servicedeskapi/request"))
+        body = kwargs["json"]
+        self.assertEqual((body["serviceDeskId"], body["requestTypeId"]), ("4", "12"))
+        self.assertLessEqual(len(body["requestFieldValues"]["summary"]), 250)
+        self.assertIn("Region: eu-west-2", body["requestFieldValues"]["description"])
+        self.assertEqual(kwargs["auth"], ("bot@example.test", "tok"))
+
+    def test_lookups_happen_once(self):
+        calls, p = self.fake(response(201, b'{"issueKey": "ISTM-7"}'), response(201, b'{"issueKey": "ISTM-8"}'))
+        with p:
+            notifiers.send_jsm(row())
+            notifiers.send_jsm(row())
+        self.assertEqual(sum(1 for c in calls if c[0] == "GET"), 2)
+
+    def test_update_is_an_internal_comment(self):
+        calls, p = self.fake(response(201))
+        with p:
+            notifiers.send_jsm(row("updated", ticket_ref="ISTM-7"))
+        method, url, kwargs = calls[-1]
+        self.assertTrue(url.endswith("/request/ISTM-7/comment"))
+        self.assertIs(kwargs["json"]["public"], False)
+
+    def test_resolve_notes_then_uses_the_named_transition(self):
+        calls, p = self.fake(response(201), response(204))
+        with p:
+            notifiers.send_jsm(row("resolved", ticket_ref="ISTM-7"))
+        self.assertTrue(calls[0][1].endswith("/rest/api/3/issue/ISTM-7/transitions"))
+        (_, note_url, note), (_, url, kwargs) = calls[-2], calls[-1]
+        self.assertTrue(note_url.endswith("/servicedeskapi/request/ISTM-7/comment"))
+        self.assertIn("resolved", note["json"]["body"])
+        self.assertIs(note["json"]["public"], False)
+        self.assertEqual(url, "https://acme.atlassian.net/rest/api/3/issue/ISTM-7/transitions")
+        self.assertEqual(kwargs["json"], {"transition": {"id": "111"}})
+
+    def test_resolve_off_leaves_a_comment(self):
+        calls, p = self.fake(response(201))
+        with mock.patch.object(notifiers, "JSM_RESOLVE", False), p:
+            notifiers.send_jsm(row("resolved", ticket_ref="ISTM-7"))
+        self.assertTrue(calls[-1][1].endswith("/comment"))
+        self.assertIn("manual review", calls[-1][2]["json"]["body"])
+
+    def test_unknown_names_say_what_exists(self):
+        with mock.patch.object(notifiers, "JSM_PROJECT", "ITSM"):
+            calls, p = self.fake()
+            with p, self.assertRaises(notifiers.PermanentFailure) as caught:
+                notifiers.send_jsm(row())
+        self.assertIn("HR, ISTM", str(caught.exception))
+        calls, p = self.fake()
+        with mock.patch.object(notifiers, "JSM_TRANSITION", "Close"), p, \
+                self.assertRaises(notifiers.PermanentFailure) as caught:
+            notifiers.send_jsm(row("resolved", ticket_ref="ISTM-7"))
+        self.assertIn("Pending, Cancel, Resolve this issue", str(caught.exception))
+        self.assertEqual([c[0] for c in calls], ["GET"])   # nothing posted
+
+    def test_refusals_carry_jsm_reason_and_auth_errors_retry(self):
+        calls, p = self.fake(response(400, b'{"errorMessage": "Field Priority is required"}'))
+        with p, self.assertRaises(notifiers.PermanentFailure) as caught:
+            notifiers.send_jsm(row())
+        self.assertIn("Field Priority is required", str(caught.exception))
+        calls, p = self.fake(response(201), response(400, b'{"errorMessages": [], "errors": {"resolution": "Resolution is required."}}'))
+        with p, self.assertRaises(notifiers.PermanentFailure) as caught:
+            notifiers.send_jsm(row("resolved", ticket_ref="ISTM-7"))
+        self.assertIn("resolution: Resolution is required.", str(caught.exception))
+        for status in (401, 429, 503):
+            calls, p = self.fake(response(status))
+            with p, self.assertRaises(notifiers.RetryLater):
+                notifiers.send_jsm(row())
+
+    def test_extra_fields_and_config_errors(self):
+        with mock.patch.object(notifiers, "JSM_EXTRA_FIELDS_RAW", '{"priority": {"name": "High"}}'):
+            calls, p = self.fake(response(201, b'{"issueKey": "ISTM-9"}'))
+            with p:
+                notifiers.send_jsm(row())
+            self.assertEqual(calls[-1][2]["json"]["requestFieldValues"]["priority"], {"name": "High"})
+        self.assertEqual([e for e in notifiers.config_errors() if "Jira" in e], [])
+        with mock.patch.object(notifiers, "JSM_API_TOKEN", ""):
+            self.assertTrue(any("Jira" in e for e in notifiers.config_errors()))
+            self.assertNotIn("jsm", notifiers.enabled_channels())
+        with mock.patch.object(notifiers, "JSM_EXTRA_FIELDS_RAW", "[1]"):
+            self.assertTrue(any("Jira" in e for e in notifiers.config_errors()))
+
+
 class Webhook(unittest.TestCase):
     def hook(self, **fields):
         return notifiers.Webhook(**{"id": 3, "name": "Test", "url": "https://hooks.example.test/in",

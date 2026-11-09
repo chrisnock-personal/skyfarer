@@ -1,7 +1,8 @@
 """
 notifiers.py
 ~~~~~~~~~~~~
-Sends incident notices to Zendesk, ServiceNow, Pushover, PagerDuty, Microsoft
+Sends incident notices to Zendesk, ServiceNow, Jira Service Management,
+Pushover, PagerDuty, Microsoft
 Teams, SNMP trap receivers and any number of outbound webhooks.
 
 Notices go through the `notifications` table, one row per channel. A poll cycle
@@ -48,6 +49,14 @@ def servicenow_url(instance: str) -> str:
     return f"https://{instance}.service-now.com"
 
 
+def jsm_url(site: str) -> str:
+    """JSM_SITE is a site name ("yourcompany") or its full URL."""
+    site = site.strip().rstrip("/")
+    if not site or "://" in site:
+        return site
+    return f"https://{site}.atlassian.net"
+
+
 @dataclass
 class Webhook:
     """One outbound webhook. There can be any number; each is its own channel."""
@@ -92,6 +101,8 @@ def configure(webhooks: Optional[list[Webhook]] = None) -> None:
     global PUSHOVER_API_URL, PUSHOVER_TOKEN, PUSHOVER_USER, PUSHOVER_PRIORITY
     global PAGERDUTY_EVENTS_URL, PAGERDUTY_ROUTING_KEY, PAGERDUTY_SEVERITY, TEAMS_WEBHOOK_URL
     global SNMP_TRAP_TARGETS, SNMP_COMMUNITY, SNMP_BASE_OID, WEBHOOKS
+    global JSM_URL, JSM_EMAIL, JSM_API_TOKEN, JSM_PROJECT, JSM_REQUEST_TYPE, JSM_RESOLVE
+    global JSM_TRANSITION, JSM_EXTRA_FIELDS_RAW
 
     NOTIFY_EVENTS = _env_list("NOTIFY_EVENTS", "opened,resolved")
     NOTIFY_MAX_AGE_HOURS = _env_float("NOTIFY_MAX_AGE_HOURS", 24)
@@ -120,6 +131,15 @@ def configure(webhooks: Optional[list[Webhook]] = None) -> None:
     SERVICENOW_RESOLVED_STATE = os.getenv("SERVICENOW_RESOLVED_STATE", "") or "6"
     SERVICENOW_CLOSE_CODE = os.getenv("SERVICENOW_CLOSE_CODE", "Resolved by caller")
     SERVICENOW_EXTRA_FIELDS_RAW = os.getenv("SERVICENOW_EXTRA_FIELDS", "")
+
+    JSM_URL = jsm_url(os.getenv("JSM_SITE", ""))
+    JSM_EMAIL = os.getenv("JSM_EMAIL", "")
+    JSM_API_TOKEN = os.getenv("JSM_API_TOKEN", "")
+    JSM_PROJECT = os.getenv("JSM_PROJECT", "").strip().upper()
+    JSM_REQUEST_TYPE = os.getenv("JSM_REQUEST_TYPE", "").strip()
+    JSM_RESOLVE = os.getenv("JSM_RESOLVE", "true").lower() in ("1", "true", "yes")
+    JSM_TRANSITION = os.getenv("JSM_TRANSITION", "").strip() or "Resolve"
+    JSM_EXTRA_FIELDS_RAW = os.getenv("JSM_EXTRA_FIELDS", "")
 
     PUSHOVER_API_URL = os.getenv("PUSHOVER_API_URL", "https://api.pushover.net/1/messages.json")
     PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
@@ -359,6 +379,155 @@ def send_servicenow(row: dict) -> Optional[dict]:
     payload = servicenow_resolve(row) if row["event"] == "resolved" else servicenow_note(row)
     resp = _request("PATCH", _sn_url(row["ticket_ref"]), json=payload, **_sn_auth())
     _check(resp, retry=retry)
+    return None
+
+
+# ─── Jira Service Management ────────────────────────────────────────────────
+
+_jsm_ids: dict[tuple, tuple[str, str]] = {}
+
+
+def _jsm_kwargs() -> dict:
+    return {"auth": (JSM_EMAIL, JSM_API_TOKEN),
+            "headers": {"Accept": "application/json"}}
+
+
+def _jsm_check(resp: requests.Response) -> None:
+    """As _check, but a refused request says why: JSM's errorMessage names the
+    field or transition at fault, which is what the person needs to fix."""
+    if resp.ok:
+        return
+    # As with Zendesk and ServiceNow, an expired token gets fixed: keep the
+    # notices queued until it is.
+    if resp.status_code >= 500 or resp.status_code in (401, 403, 429):
+        raise RetryLater(f"HTTP {resp.status_code}")
+    try:
+        body = resp.json()
+        # The Service Desk API says errorMessage; Jira's own API errorMessages
+        # and errors (by field).
+        detail = body.get("errorMessage") or "; ".join(
+            list(body.get("errorMessages") or [])
+            + [f"{k}: {v}" for k, v in (body.get("errors") or {}).items()])
+    except (ValueError, AttributeError):
+        detail = ""
+    raise PermanentFailure(f"HTTP {resp.status_code}" + (f": {detail}"[:300] if detail else ""))
+
+
+def _jsm_get(path: str, api: str = "servicedeskapi") -> dict:
+    resp = _request("GET", f"{JSM_URL}/rest/{api}/{path}", **_jsm_kwargs())
+    _jsm_check(resp)
+    return resp.json()
+
+
+def _jsm_pick(items: list[dict], wanted: str, name_key: str, what: str) -> dict:
+    """The item whose ID or name is `wanted`; a name may match without regard
+    to case, or as part of a longer name ("Resolve" finds "Resolve this
+    issue"). Fails with the names that do exist, so the setting is easy to fix."""
+    w = wanted.strip().lower()
+    for test in (lambda i: str(i.get("id")) == wanted.strip(),
+                 lambda i: str(i.get(name_key, "")).lower() == w,
+                 lambda i: w in str(i.get(name_key, "")).lower()):
+        found = [i for i in items if test(i)]
+        if found:
+            return found[0]
+    names = ", ".join(str(i.get(name_key)) for i in items) or "none"
+    raise PermanentFailure(f"no {what} called {wanted!r} (there are: {names})"[:300])
+
+
+def jsm_ids() -> tuple[str, str]:
+    """The service desk ID and request type ID for JSM_PROJECT and
+    JSM_REQUEST_TYPE, looked up once per setting."""
+    key = (JSM_URL, JSM_PROJECT, JSM_REQUEST_TYPE)
+    if key not in _jsm_ids:
+        desks = _jsm_get("servicedesk?limit=100").get("values") or []
+        desk = _jsm_pick(desks, JSM_PROJECT, "projectKey", "service desk with project key")
+        types = _jsm_get(f"servicedesk/{desk['id']}/requesttype?limit=100").get("values") or []
+        if JSM_REQUEST_TYPE:
+            rtype = _jsm_pick(types, JSM_REQUEST_TYPE, "name", "request type")
+        elif types:
+            rtype = types[0]
+        else:
+            raise PermanentFailure(f"service desk {JSM_PROJECT} has no request types")
+        _jsm_ids[key] = (str(desk["id"]), str(rtype["id"]))
+    return _jsm_ids[key]
+
+
+def _jsm_extra_fields() -> dict:
+    """JSM_EXTRA_FIELDS: a JSON object of more request fields, such as
+    {"priority": {"name": "High"}}. Checked when it's saved."""
+    if not JSM_EXTRA_FIELDS_RAW.strip():
+        return {}
+    value = json.loads(JSM_EXTRA_FIELDS_RAW)
+    if not isinstance(value, dict):
+        raise ValueError("not a JSON object")
+    return value
+
+
+def jsm_request(row: dict) -> dict:
+    n = row["payload"]
+    desk_id, type_id = jsm_ids()
+    description = (
+        f"Provider: {n['provider']}\n"
+        f"Region: {n['region']}\n"
+        f"Status page: {n['link']}\n\n"
+        f"Incident published: {n['published']}\n"
+        f"Last updated: {n['updated']}\n"
+        f"Detected by Skyfarer: {n['noticed']}\n\n"
+        f"{n['summary']}"
+    )
+    fields = {"summary": _subject(row)[:250], "description": description[:30000]}
+    fields.update(_jsm_extra_fields())
+    return {"serviceDeskId": desk_id, "requestTypeId": type_id, "requestFieldValues": fields}
+
+
+def jsm_note(row: dict) -> dict:
+    n = row["payload"]
+    count = n.get("update_count", 1)
+    heading = (f"{count} new updates from {n['provider']}" if count > 1
+               else f"New update from {n['provider']}")
+    return {"body": (f"{heading} (published {n['published']})\n{n['link']}\n\n"
+                     f"{n['title']}\n\n{n['summary']}")[:30000], "public": False}
+
+
+def _jsm_closing_note(row: dict) -> str:
+    n = row["payload"]
+    return (f"{n['provider']} reports this incident resolved "
+            f"(feed updated {n['updated']}, detected {n['noticed']}).\n"
+            f"{n['link']}\n\n{n['summary']}")[:30000]
+
+
+def send_jsm(row: dict) -> Optional[dict]:
+    """Returns {"ref": key, "number": key} when a request is created."""
+    base = f"{JSM_URL}/rest/servicedeskapi/request"
+    if row["event"] == "opened":
+        resp = _request("POST", base, json=jsm_request(row), **_jsm_kwargs())
+        _jsm_check(resp)
+        key = resp.json().get("issueKey")
+        if not key:
+            raise PermanentFailure("no issueKey in the response")
+        return {"ref": key, "number": key}
+
+    key = row.get("ticket_ref")
+    if not key:
+        raise PermanentFailure("incident has no Jira Service Management request")
+    if row["event"] == "resolved" and JSM_RESOLVE:
+        # The Service Desk API only offers the transitions a customer may make,
+        # which is often none: an agent's workflow transitions come from Jira's
+        # own issue API. Checked before the note, so a wrong name adds nothing.
+        transitions = _jsm_get(f"issue/{key}/transitions", api="api/3").get("transitions") or []
+        transition = _jsm_pick(transitions, JSM_TRANSITION, "name", "transition")
+        resp = _request("POST", f"{base}/{key}/comment", **_jsm_kwargs(),
+                        json={"body": _jsm_closing_note(row), "public": False})
+        _jsm_check(resp)
+        resp = _request("POST", f"{JSM_URL}/rest/api/3/issue/{key}/transitions", **_jsm_kwargs(),
+                        json={"transition": {"id": str(transition["id"])}})
+        _jsm_check(resp)
+        return None
+    body = jsm_note(row) if row["event"] == "updated" else {
+        "body": _jsm_closing_note(row) + "\n\nLeft open for manual review and closure.",
+        "public": False}
+    resp = _request("POST", f"{base}/{key}/comment", json=body, **_jsm_kwargs())
+    _jsm_check(resp)
     return None
 
 
@@ -611,6 +780,7 @@ def send_snmp(row: dict) -> None:
 SENDERS: dict[str, Callable[[dict], object]] = {
     "zendesk": send_zendesk,
     "servicenow": send_servicenow,
+    "jsm": send_jsm,
     "pushover": send_pushover,
     "pagerduty": send_pagerduty,
     "teams": send_teams,
@@ -619,7 +789,7 @@ SENDERS: dict[str, Callable[[dict], object]] = {
 
 # Ticketing systems keep a record of every incident, old ones and maintenance
 # included, and get every event; the others are alert channels.
-TICKET_CHANNELS = ("zendesk", "servicenow")
+TICKET_CHANNELS = ("zendesk", "servicenow", "jsm")
 
 # PagerDuty alerts have no "update" action: an event would just re-trigger.
 CHANNEL_EVENTS = {
@@ -642,6 +812,8 @@ def enabled_channels() -> list[str]:
         channels.append("zendesk")
     if SERVICENOW_URL and (SERVICENOW_TOKEN or (SERVICENOW_USER and SERVICENOW_PASSWORD)):
         channels.append("servicenow")
+    if JSM_URL and JSM_EMAIL and JSM_API_TOKEN and JSM_PROJECT:
+        channels.append("jsm")
     if PUSHOVER_TOKEN and PUSHOVER_USER:
         channels.append("pushover")
     if PAGERDUTY_ROUTING_KEY:
@@ -675,6 +847,13 @@ def config_errors() -> list[str]:
         _sn_extra_fields()
     except ValueError as exc:
         errors.append(f"ServiceNow extra fields must be a JSON object: {exc}")
+    jsm = (JSM_URL, JSM_EMAIL, JSM_API_TOKEN, JSM_PROJECT)
+    if any(jsm) and not all(jsm):
+        errors.append("Jira Service Management needs a site, an email, an API token and a project key")
+    try:
+        _jsm_extra_fields()
+    except ValueError as exc:
+        errors.append(f"Jira Service Management extra fields must be a JSON object: {exc}")
     if bool(PUSHOVER_TOKEN) != bool(PUSHOVER_USER):
         errors.append("Pushover needs both an application token and a user key")
     if PUSHOVER_PRIORITY not in ("-2", "-1", "0", "1", "2"):

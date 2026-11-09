@@ -8,7 +8,8 @@
 **Skyfarer** keeps watch over the clouds you run on. It polls the public status
 pages of AWS, Azure, Google Cloud, OVHcloud, DigitalOcean, Hetzner, Linode,
 Cloudflare and Scaleway for incidents and maintenance in the regions you care
-about. It raises Zendesk tickets or ServiceNow incidents and sends Pushover,
+about. It raises Zendesk tickets, ServiceNow incidents or Jira Service Management
+requests and sends Pushover,
 PagerDuty, Microsoft Teams, SNMP trap and webhook notifications, then follows
 up when the provider marks the incident clear.
 
@@ -96,7 +97,8 @@ dashboard:
   codes, and there's the keyword filter and the poll interval.
 - **Channels.** The alert rules (which events, how old is too old, how long to
   retry, maintenance), then Zendesk, ServiceNow, Pushover, PagerDuty, Teams and
-  SNMP, each with its own switch, editor and test button. A test uses the saved
+  SNMP, plus Jira Service Management, each with its own switch, editor and
+  test button. A test uses the saved
   settings: a ServiceNow test creates a record and resolves it, a Zendesk test
   opens a ticket and sets it to pending.
 - **Webhooks.** Any number, each with its own URL, method, events, template,
@@ -291,15 +293,17 @@ that name no watched region are logged, as are entries with no parseable date.
 
 ## Notifications
 
-Six channels plus any number of webhooks, each set up under Settings >
-Channels (or in `.env` before the first start). Any can run alone. Zendesk and
-ServiceNow are the ticketing channels; the rest alert people and systems. The
+Seven channels plus any number of webhooks, each set up under Settings >
+Channels (or in `.env` before the first start). Any can run alone. Zendesk,
+ServiceNow and Jira Service Management are the ticketing channels; the rest
+alert people and systems. The
 settings column gives each setting's name in `.env` and in the database.
 
 | Channel | What it sends | Settings |
 |---------|---------------|----------|
 | Zendesk | A ticket, internal notes for updates, pending when resolved | `ZENDESK_*`, `ZD_TICKET_*` |
 | ServiceNow | A record in the `incident` table through the Table API, work notes for updates, Resolved (with a close code) when the incident ends | `SERVICENOW_*` |
+| Jira Service Management | A request in a service desk through its REST API, internal comments for updates, resolved through a workflow transition when the incident ends | `JSM_*` |
 | Pushover | A push message per event, with a link to the status page | `PUSHOVER_TOKEN`, `PUSHOVER_USER`, `PUSHOVER_PRIORITY` |
 | PagerDuty | An Events API v2 alert, resolved automatically when the incident ends | `PAGERDUTY_ROUTING_KEY`, `PAGERDUTY_SEVERITY` |
 | Microsoft Teams | An Adaptive Card, posted to a Workflows webhook | `TEAMS_WEBHOOK_URL` |
@@ -324,7 +328,7 @@ Notices for one incident on one channel stay in order.
 |--------|--------------|
 | Network error, HTTP 5xx | Retried with growing gaps, up to an hour apart, for `NOTIFY_RETRY_HOURS` (24) |
 | HTTP 429 | The same, except Pushover, whose rules say not to retry a 4xx |
-| HTTP 401, 403 from Zendesk or ServiceNow | The same, so tickets survive an expired token or password |
+| HTTP 401, 403 from Zendesk, ServiceNow or Jira | The same, so tickets survive an expired token or password |
 | Other HTTP 4xx | Marked failed, not retried |
 
 **ServiceNow.** Records are created through the Table API (`/api/now/table/incident`
@@ -339,6 +343,22 @@ provider says it's over, the record moves to Resolved (state 6) with
 `SERVICENOW_CLOSE_CODE` and close notes, and ServiceNow's own auto-close closes
 it later; `SERVICENOW_RESOLVE=false` only adds a work note and leaves it for a
 person. The close code must be one your instance accepts.
+
+**Jira Service Management.** Requests are raised in the service project
+`JSM_PROJECT` (its key, such as `ITSM`) with the request type `JSM_REQUEST_TYPE`
+(its name; empty takes the project's first), as the Atlassian account
+`JSM_EMAIL` with a personal API token from id.atlassian.com (an organisation
+admin API key won't work). The account must be an agent on the service desk.
+Updates are internal comments. When the incident ends, Skyfarer adds an
+internal comment and applies the workflow transition named in
+`JSM_TRANSITION` (by default `Resolve`; part of a name will do), found through
+Jira's issue API, because the Service Desk API only offers the transitions a
+customer may make. `JSM_RESOLVE=false` leaves a comment instead. A name that
+doesn't exist fails with a list of the ones that do, which the test button
+shows. `JSM_EXTRA_FIELDS` adds request fields, such as
+`{"priority": {"name": "High"}}`. Tested against a real Jira Service Management
+Cloud site with the IT service management template, where `Resolve` moves a
+request to Completed.
 
 **Webhooks.** For anything else: a chat tool, an on-call service, an automation
 platform or your own system, as many as you need. Each sends its own requests,

@@ -311,6 +311,9 @@ def _channel_summary(cid: str, values: dict) -> str:
         host = urlsplit(notifiers.servicenow_url(v("SERVICENOW_INSTANCE"))).netloc
         auth = "OAuth token" if v("SERVICENOW_TOKEN") else "user and password"
         return f"{host} · {auth}"
+    if cid == "jsm" and v("JSM_SITE"):
+        host = urlsplit(notifiers.jsm_url(v("JSM_SITE"))).netloc
+        return f"{host} · project {v('JSM_PROJECT') or 'not set'}"
     if cid == "pushover" and v("PUSHOVER_USER"):
         return f"priority {effective(values, 'PUSHOVER_PRIORITY')} for new incidents"
     if cid == "pagerduty" and v("PAGERDUTY_ROUTING_KEY"):
@@ -512,6 +515,11 @@ def run_test(channel: str) -> tuple[bool, str]:
             sender({**row, "event": "resolved", "ticket_ref": result["ref"]})
             message = (f"Test record {result['number'] or result['ref']} created and "
                        + ("resolved." if notifiers.SERVICENOW_RESOLVE else "given a closing note."))
+        elif channel == "jsm":
+            sender({**row, "event": "resolved", "ticket_ref": result["ref"]})
+            message = (f"Test request {result['number']} created and "
+                       + (f"resolved with “{notifiers.JSM_TRANSITION}”." if notifiers.JSM_RESOLVE
+                          else "given a closing comment."))
         elif channel == "pagerduty":
             sender({**row, "event": "resolved"})
             message = "Test alert triggered and resolved again."
