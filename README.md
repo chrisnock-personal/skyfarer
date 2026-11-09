@@ -127,8 +127,11 @@ one-time setup link to pass on (Skyfarer sends no email); it expires after 24
 hours. The same is how a forgotten password is reset. Passwords are hashed
 (scrypt); after five wrong attempts for one email from one address, that pair
 waits 15 minutes.
-Sessions last 12 hours. Behind an HTTPS proxy, set `DASHBOARD_HTTPS=true` so
-the session cookie is only sent over HTTPS.
+Sessions last 12 hours. Behind an HTTPS proxy, set `DASHBOARD_HTTPS=true`: the
+session cookie is then only sent over HTTPS, and the dashboard takes the
+client's address, scheme and host from the proxy's `X-Forwarded-*` headers (for
+setup links and the sign-in throttle). Leave it unset without a proxy, so
+those headers aren't trusted. The dashboard runs under gunicorn.
 
 **Change history.** Every change is recorded with who made it and when,
 including switches, regions added and removed, and users added or removed.
@@ -236,11 +239,14 @@ One row per poll cycle -useful for spotting gaps or failures.
 
 ```
 Feed entry appears         → row inserted (state=open), notices queued,
-                             Zendesk ticket / ServiceNow record created
-Feed entry updated         → re-checked each cycle for a resolved status
+                             Zendesk ticket / ServiceNow record / Jira request
+Provider posts an update   → stored with the incident, row shows it,
+                             "updated" notices queued: a ticket note (and an
+                             alert, if NOTIFY_EVENTS includes updated)
 Resolved status found      → row → resolved, notices queued,
                              Zendesk note + ticket → pending,
-                             ServiceNow work note + record → Resolved
+                             ServiceNow work note + record → Resolved,
+                             Jira comment + Resolve transition
 Operator reviews & closes  → manual step in Zendesk; ServiceNow auto-closes
 ```
 
@@ -270,6 +276,18 @@ update such as "power has not yet been restored" leaves the incident open.
 
 A feed that can't be read leaves its incidents as they were, and is shown on
 the dashboard and recorded in `poll_log.feed_errors`.
+
+### Updates on providers with a stable event ID
+
+Most providers keep one ID for an incident's whole life and change what it
+says: the Statuspage providers, OVH, Hetzner and Google Cloud. Each poll
+compares an open incident's title and latest update with what was stored, and
+a difference is an update, handled like an AWS or Azure one: stored in
+`incident_updates`, shown on the incident's row, added to its ticket as a note,
+and sent to alert channels if `NOTIFY_EVENTS` includes `updated`. An update is
+identified by the incident's ID plus a hash of its words, so the same text is
+never recorded twice. Several updates between two polls arrive as one, with the
+newest text.
 
 ### Providers without a stable event ID
 
@@ -461,6 +479,43 @@ notification -they never appear in `incidents`, `poll_log`'s `entries_seen` coun
 or the dashboard. Both are set under Settings > Providers and regions, and a
 change applies from the next poll.
 
+## Backups
+
+Two things make a Skyfarer install: the Postgres database, which holds the
+incidents, the settings, the webhooks and the accounts, and
+`SKYFARER_SECRET_KEY` in `.env`, without which the keys, passwords and tokens
+stored in the database can't be decrypted. Back up both, and keep them apart:
+a copy of the database is no use to anyone without the key.
+
+**Back up**, while everything runs:
+
+```bash
+docker compose exec -T db pg_dump -U skyfarer -Fc skyfarer > skyfarer-$(date +%F).dump
+```
+
+`-Fc` is Postgres's compressed custom format. Use your `POSTGRES_USER` and
+`POSTGRES_DB` if you changed them. Run it from cron for a daily copy.
+
+**Restore**, onto the same install or a new one with the same
+`SKYFARER_SECRET_KEY` in its `.env`:
+
+```bash
+docker compose stop poller dashboard
+docker compose exec -T db pg_restore -U skyfarer -d skyfarer --clean --if-exists < skyfarer-2026-11-09.dump
+docker compose start poller dashboard
+```
+
+Everyone signs in as before; the settings, webhooks and change history are as
+they were; and queued notices are sent on the next poll. Stopping the poller
+and dashboard first keeps them from writing while the tables are replaced.
+
+**If the key is lost**, restore the database anyway with a new key: incidents,
+history, accounts and every other setting come back. Each secret that can't be
+read is marked "Unreadable" under Settings > Channels and named in the
+poller's log; the channel shows as incomplete until it's entered again. A
+webhook whose signing secret or headers can't be read is held back rather than
+sent unsigned or without its key.
+
 ## Running outside Docker
 
 If you prefer to run the poller directly:
@@ -471,8 +526,12 @@ export POSTGRES_HOST=localhost   # or wherever your PG is
 python poller.py --init-db
 python poller.py --once --dry-run   # test first
 python poller.py                     # continuous
-python dashboard.py                  # the dashboard, on :8080
+python dashboard.py                  # the dashboard, on :8080 (Flask's own server)
+gunicorn --workers 1 --threads 8 --bind 0.0.0.0:8080 wsgi:app   # as compose runs it
 ```
+
+Run the dashboard as one process (threads for concurrency): the first-run
+setup code and the sign-in throttle are held in its memory.
 
 ## Modes
 

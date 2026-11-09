@@ -7,13 +7,13 @@
 </div>
 {% endblock %}
 
-{% macro secret_field(key, label, stored, help='', wide=false) %}
+{% macro secret_field(key, label, stored, help='', wide=false, bad=false) %}
 <div class="field {{ 'wide' if wide }}">
   <span class="label" id="lbl-{{ key }}">{{ label }}</span>
   {% if stored %}
   <details class="replace">
     <summary aria-label="{{ label }}: stored, {{ stored }}. Replace or remove">
-      <div class="stored"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--good)" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="flex: none"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span><strong>Stored</strong> · {{ stored }}</span><span class="btn small" style="flex: none">Replace</span></div>
+      <div class="stored {{ 'bad' if bad }}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="{{ 'var(--bad)' if bad else 'var(--good)' }}" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="flex: none"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span><strong>{{ 'Unreadable' if bad else 'Stored' }}</strong> · {{ stored }}</span><span class="btn small" style="flex: none">Replace</span></div>
     </summary>
     <div class="new">
       {% if wide %}
@@ -93,8 +93,8 @@
     <label for="{{ prefix }}-ct">Content type</label>
     <input class="input" id="{{ prefix }}-ct" name="content_type" value="{{ h.content_type or 'application/json' }}">
   </div>
-  {{ secret_field('secret', 'Signing secret', h.secret_stored, 'Signs each body with HMAC-SHA256, in the X-Skyfarer-Signature header.') }}
-  {{ secret_field('headers', 'Extra headers (JSON)', h.headers_stored, 'Such as {"Authorization": "Bearer …"}. Stored like a password, as headers often hold keys.', wide=true) }}
+  {{ secret_field('secret', 'Signing secret', h.secret_stored, 'Signs each body with HMAC-SHA256, in the X-Skyfarer-Signature header.', bad=h.secret_bad) }}
+  {{ secret_field('headers', 'Extra headers (JSON)', h.headers_stored, 'Such as {"Authorization": "Bearer …"}. Stored like a password, as headers often hold keys.', wide=true, bad=h.headers_bad) }}
   <div class="field wide">
     <label for="{{ prefix }}-tpl">Body template</label>
     <textarea class="input" id="{{ prefix }}-tpl" name="template" placeholder='{"text": "{{ '{{' }}event{{ '}}' }}: [{{ '{{' }}provider{{ '}}' }}] {{ '{{' }}title{{ '}}' }} {{ '{{' }}link{{ '}}' }}"}'>{{ h.template }}</textarea>
@@ -154,7 +154,7 @@
         {% for x in c.fields %}
           {% set f = x.f %}
           {% if f.kind == 'secret' %}
-            {{ secret_field(f.key, f.label, x.stored, f.help) }}
+            {{ secret_field(f.key, f.label, x.stored, f.help, bad=x.bad) }}
           {% elif f.kind == 'bool' %}
             <fieldset class="field">
               <legend>{{ f.label }}</legend>

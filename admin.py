@@ -334,10 +334,11 @@ def _health() -> dict:
 def channels(submitted: Optional[dict] = None, open_id: Optional[str] = None,
              errors: Optional[list] = None):
     open_id = open_id or request.args.get("open", "")
+    unreadable: set = set()
     with db.get_conn() as conn:
-        values = settings.load(conn)
+        values = settings.load(conn, unreadable)
         meta = settings.secret_meta(conn)
-        hooks = settings.webhooks(conn, values)
+        hooks = settings.webhooks(conn, values, unreadable=unreadable)
     health = _health()
     enabled = set(notifiers.enabled_channels())
 
@@ -356,6 +357,8 @@ def channels(submitted: Optional[dict] = None, open_id: Optional[str] = None,
         m = meta.get(key)
         if not m:
             return None
+        if key in unreadable:
+            return "can't be read: SKYFARER_SECRET_KEY has changed since it was set. Enter it again"
         return f"set {m['updated_at']:%d %b %Y} by {m['updated_by'] or 'Skyfarer'}"
 
     groups = []
@@ -376,6 +379,7 @@ def channels(submitted: Optional[dict] = None, open_id: Optional[str] = None,
                 if f.kind == "list":
                     value = ", ".join(settings.split_list(value))
                 fields.append({"f": f, "value": value, "stored": stored(f.key) if f.kind == "secret" else None,
+                               "bad": f.key in unreadable,
                                "checked": (sub.get(f.key) if sub is not None else value == "true")})
             cards.append({"id": c.id, "name": c.name, "on": on, "fields": fields,
                           "summary": _channel_summary(c.id, values),
@@ -400,10 +404,14 @@ def channels(submitted: Optional[dict] = None, open_id: Optional[str] = None,
             "content_type": src.get("content_type", "") if src else h.content_type,
             "headers_stored": stored(settings.webhook_secret_key(w["id"], "headers")),
             "secret_stored": stored(settings.webhook_secret_key(w["id"], "secret")),
+            "headers_bad": settings.webhook_secret_key(w["id"], "headers") in unreadable,
+            "secret_bad": settings.webhook_secret_key(w["id"], "secret") in unreadable,
             "summary": f"{h.method} to {url.netloc or h.url}"
                        + (" · " + ", ".join(h.events) if h.events else " · follows the alert rules")
                        + (" · signed" if h.secret else ""),
             **status(h.channel, w["enabled"], h.channel in enabled)})
+        if w["unreadable"] and w["enabled"]:
+            hook_cards[-1].update(status="Secret unreadable", tone="bad")
 
     rules = {"events": settings.split_list(effective(values, "NOTIFY_EVENTS")),
              "max_age": effective(values, "NOTIFY_MAX_AGE_HOURS"),

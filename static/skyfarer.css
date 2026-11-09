@@ -276,3 +276,4 @@ details.replace .new { display: flex; flex-direction: column; gap: 8px; }
   .who-name { display: none; }
   .tools .search { flex: 1 1 100%; order: 3; }
 }
+.stored.bad { border-color: var(--bad); background: var(--bad-bg); }

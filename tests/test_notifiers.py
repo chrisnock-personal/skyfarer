@@ -604,5 +604,65 @@ class Alerting(unittest.TestCase):
             self.assertTrue(poller._worth_alerting(self.entry(maintenance=True)))
 
 
+
+class StableIdUpdates(unittest.TestCase):
+    """Providers that keep one ID per incident (Statuspage ones, Hetzner, GCP,
+    OVH) pass new updates on while the incident is open, not just at the end."""
+
+    def entry(self, summary, resolved=False):
+        now = datetime.now(timezone.utc)
+        return feeds.FeedEntry(
+            provider="DigitalOcean", region="LON1", guid="digitalocean:abc", title="Droplet creates failing",
+            summary=summary, link="l", published="p", updated="u", is_resolved=resolved,
+            published_dt=now, updated_dt=now)
+
+    def poll(self, entries, rec):
+        with mock.patch.object(poller, "fetch_all", return_value=(entries, None, None)), \
+                mock.patch.object(poller.db, "get_conn"), \
+                mock.patch.object(poller.db, "get_known_guids", return_value={"digitalocean:abc"}), \
+                mock.patch.object(poller.db, "get_open_guids", return_value={"digitalocean:abc": rec}), \
+                mock.patch.object(poller.db, "add_update") as add, \
+                mock.patch.object(poller.db, "refresh_incident") as refresh, \
+                mock.patch.object(poller.db, "mark_resolved"), \
+                mock.patch.object(poller.db, "log_poll"), \
+                mock.patch.object(poller.db, "count_open", return_value=1), \
+                mock.patch.object(poller.notifiers, "enqueue") as enqueue, \
+                mock.patch.object(poller.notifiers, "deliver_pending"):
+            poller.poll_once()
+        return add, refresh, enqueue
+
+    def rec(self, summary):
+        return {"id": 3, "guid": "digitalocean:abc", "ticket_id": None, "provider": "DigitalOcean",
+                "region": "LON1", "title": "Droplet creates failing", "summary": summary}
+
+    def test_new_words_are_an_update(self):
+        add, refresh, enqueue = self.poll([self.entry("Identified: a storage cluster is degraded")],
+                                          self.rec("Investigating: failed creates"))
+        self.assertTrue(add.call_args.kwargs["guid"].startswith("digitalocean:abc#"))
+        self.assertEqual(refresh.call_args.kwargs["summary"], "Identified: a storage cluster is degraded")
+        self.assertEqual(refresh.call_args.kwargs["added_updates"], 1)
+        (conn, incident_id, event, notice), kwargs = enqueue.call_args
+        self.assertEqual((incident_id, event), (3, "updated"))
+        self.assertEqual(notice["summary"], "Identified: a storage cluster is degraded")
+
+    def test_same_words_are_not(self):
+        add, refresh, enqueue = self.poll([self.entry("Investigating: failed creates")],
+                                          self.rec("Investigating: failed creates"))
+        add.assert_not_called()
+        enqueue.assert_not_called()
+
+    def test_ending_is_still_a_resolve_not_an_update(self):
+        add, refresh, enqueue = self.poll([self.entry("Resolved: all good", resolved=True)],
+                                          self.rec("Investigating: failed creates"))
+        add.assert_not_called()
+        self.assertEqual([c.args[2] for c in enqueue.call_args_list], ["resolved"])
+
+    def test_the_update_id_follows_the_words(self):
+        first = self.poll([self.entry("A")], self.rec("x"))[0].call_args.kwargs["guid"]
+        again = self.poll([self.entry("A")], self.rec("y"))[0].call_args.kwargs["guid"]
+        other = self.poll([self.entry("B")], self.rec("x"))[0].call_args.kwargs["guid"]
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, other)
+
 if __name__ == "__main__":
     unittest.main()

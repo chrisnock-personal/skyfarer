@@ -198,10 +198,11 @@ def get_known_guids(conn) -> set[str]:
 
 
 def get_open_guids(conn) -> dict[str, dict]:
-    """Return open incidents as {guid: {id, guid, ticket_id, provider, region, title}}."""
+    """Return open incidents as {guid: {id, guid, ticket_id, provider, region,
+    title, summary}}."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, guid, ticket_id, provider, region, title "
+            "SELECT id, guid, ticket_id, provider, region, title, summary "
             "FROM incidents WHERE state = 'open'"
         )
         return {row["guid"]: dict(row) for row in cur.fetchall()}

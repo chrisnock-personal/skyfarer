@@ -33,7 +33,7 @@ class Applying(unittest.TestCase):
 
     def apply(self, values, hooks=()):
         rows = [{"id": h.id, "enabled": True, "hook": h} for h in hooks]
-        with mock.patch.object(settings, "load", return_value=values), \
+        with mock.patch.object(settings, "load", side_effect=lambda conn, unreadable=None: dict(values)), \
                 mock.patch.object(settings, "webhooks", return_value=rows):
             settings.apply(conn=object())
 
@@ -62,6 +62,17 @@ class Applying(unittest.TestCase):
         self.apply(values)
         self.assertEqual(feeds.HETZNER_REGIONS, ["FSN1"])
         self.assertIn("teams", notifiers.enabled_channels())
+
+    def test_webhook_with_unreadable_secret_is_held_back(self):
+        rows = [{"id": 2, "enabled": True, "name": "n8n", "url": "https://a.example.test/",
+                 "method": "POST", "template": "", "content_type": "application/json", "events": ""}]
+        with mock.patch.object(settings, "_rows", side_effect=lambda *a: [dict(r) for r in rows]):
+            kept = settings.webhooks(object(), {}, enabled_only=True, unreadable={"WEBHOOK_2_SECRET"})
+            shown = settings.webhooks(object(), {}, unreadable={"WEBHOOK_2_SECRET"})
+            fine = settings.webhooks(object(), {}, enabled_only=True, unreadable=set())
+        self.assertEqual(kept, [])
+        self.assertTrue(shown[0]["unreadable"])
+        self.assertEqual([w["hook"].channel for w in fine], ["webhook-2"])
 
     def test_webhooks_come_from_their_table_not_env(self):
         os.environ["WEBHOOK_URL"] = "https://from-env.example.test/"

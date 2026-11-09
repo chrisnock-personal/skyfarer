@@ -286,8 +286,9 @@ def _rows(conn, sql: str, params=None) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-def load(conn) -> dict[str, str]:
-    """Every stored setting, secrets decrypted."""
+def load(conn, unreadable: Optional[set] = None) -> dict[str, str]:
+    """Every stored setting, secrets decrypted. A secret that can't be
+    decrypted (the key has changed) is left out, and named in `unreadable`."""
     values = {}
     for r in _rows(conn, "SELECT key, value, secret FROM settings WHERE key NOT LIKE '\\_%'"):
         if r["secret"]:
@@ -296,6 +297,8 @@ def load(conn) -> dict[str, str]:
             except InvalidToken:
                 log.error("Can't decrypt %s: SKYFARER_SECRET_KEY has changed since it was "
                           "saved. Enter it again in the dashboard.", r["key"])
+                if unreadable is not None:
+                    unreadable.add(r["key"])
                 continue
         else:
             values[r["key"]] = r["value"]
@@ -366,12 +369,21 @@ def describe_change(key: str, old: Optional[str], new: str) -> str:
 
 # ─── Webhooks ───────────────────────────────────────────────────────────────
 
-def webhooks(conn, values: Optional[dict] = None, *, enabled_only: bool = False) -> list[dict]:
-    """Every webhook as a dict, with its notifiers.Webhook under "hook"."""
-    values = load(conn) if values is None else values
+def webhooks(conn, values: Optional[dict] = None, *, enabled_only: bool = False,
+             unreadable: Optional[set] = None) -> list[dict]:
+    """Every webhook as a dict, with its notifiers.Webhook under "hook". A
+    webhook whose headers or signing secret can't be decrypted is marked
+    "unreadable" and left out with enabled_only: sending it without its
+    signature or API key would quietly weaken it."""
+    if values is None:
+        unreadable = set() if unreadable is None else unreadable
+        values = load(conn, unreadable)
+    unreadable = unreadable or set()
     out = []
     for r in _rows(conn, "SELECT * FROM webhooks ORDER BY id"):
-        if enabled_only and not r["enabled"]:
+        r["unreadable"] = bool({webhook_secret_key(r["id"], "headers"),
+                                webhook_secret_key(r["id"], "secret")} & unreadable)
+        if enabled_only and (not r["enabled"] or r["unreadable"]):
             continue
         r["hook"] = notifiers.Webhook(
             id=r["id"], name=r["name"], url=r["url"], method=r["method"],
@@ -471,8 +483,9 @@ def _configure(values: dict[str, str], hooks: list) -> None:
 def apply(conn=None) -> dict[str, str]:
     """Load the stored settings and put them to work in this process."""
     def run(c):
-        values = load(c)
-        hooks = [w["hook"] for w in webhooks(c, values, enabled_only=True)]
+        unreadable: set = set()
+        values = load(c, unreadable)
+        hooks = [w["hook"] for w in webhooks(c, values, enabled_only=True, unreadable=unreadable)]
         with _apply_lock:
             _configure(values, hooks)
         return values
@@ -486,14 +499,16 @@ def check(conn, changes: dict[str, Optional[str]], hooks: Optional[list] = None)
     """The problems the stored settings would have with these changes made,
     without saving them. Configures this process with the trial values and
     puts the stored ones back afterwards."""
-    values = load(conn)
+    unreadable: set = set()
+    values = load(conn, unreadable)
     trial = dict(values)
     for k, v in changes.items():
         if (v or "").strip():
             trial[k] = v.strip()
         else:
             trial.pop(k, None)
-    current_hooks = [w["hook"] for w in webhooks(conn, values, enabled_only=True)]
+    current_hooks = [w["hook"] for w in webhooks(conn, values, enabled_only=True,
+                                                 unreadable=unreadable)]
     with _apply_lock:
         try:
             _configure(trial, current_hooks if hooks is None else hooks)

@@ -33,7 +33,10 @@ services:
   dashboard:
     build: .
     restart: unless-stopped
-    entrypoint: ["python", "-u", "dashboard.py"]
+    # One process with threads: the first-run setup code and the sign-in
+    # throttle live in its memory.
+    entrypoint: ["gunicorn", "--workers", "1", "--threads", "8", "--bind", "0.0.0.0:8080",
+                 "--access-logfile", "-", "wsgi:app"]
     depends_on:
       db:
         condition: service_healthy

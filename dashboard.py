@@ -19,6 +19,7 @@ from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 from flask import Flask, render_template, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 from psycopg2.extras import RealDictCursor
 
 # Before the imports below: each reads its settings when it loads.
@@ -41,6 +42,11 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.getenv("DASHBOARD_HTTPS", "").lower() in ("1", "true", "yes"),
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
+if app.config["SESSION_COOKIE_SECURE"]:
+    # Behind a TLS proxy: take the client address, scheme and host from its
+    # X-Forwarded-* headers, so setup links and the sign-in throttle are right.
+    # Only then: without a proxy those headers would come from anyone.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 VALID_STATES = ("all", "open", "resolved")
 VALID_RANGES = ("all", "today", "7d", "30d", "90d", "custom")
@@ -438,6 +444,8 @@ def configure_app() -> None:
 
 
 if __name__ == "__main__":
+    # Flask's own server, for trying things out. Compose runs wsgi.py under
+    # gunicorn instead.
     configure_app()
     port = int(os.getenv("DASHBOARD_PORT", "8080"))
     app.run(host="0.0.0.0", port=port)

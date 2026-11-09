@@ -22,6 +22,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import hashlib
 import logging
 import os
 import sys
@@ -161,6 +163,27 @@ def _apply_updates(conn, rec: dict, updates: list[FeedEntry], dry_run: bool) -> 
                 update_count=len(updates))
 
 
+def _changed(rec: dict, entry: FeedEntry) -> bool:
+    """Has a provider with stable incident IDs said something new? Its entry
+    keeps the same ID all through, and the title or the latest update's text
+    (the summary) is what moves on."""
+    return ((entry.title or "").strip() != (rec.get("title") or "").strip()
+            or (entry.summary or "").strip() != (rec.get("summary") or "").strip())
+
+
+def _update_from_stable(conn, rec: dict, entry: FeedEntry, dry_run: bool) -> None:
+    """Record what changed on a stable-ID incident as an update, the way AWS
+    and Azure updates are: kept in the incident's history, shown on its row,
+    and queued for the channels (tickets always; alerts if NOTIFY_EVENTS asks
+    for updates). The update's own ID is the incident's plus a hash of what
+    it says, so the same words are never recorded twice."""
+    digest = hashlib.sha256(f"{entry.title}\n{entry.summary}".encode()).hexdigest()[:16]
+    update = dataclasses.replace(entry, guid=f"{entry.guid}#{digest}")
+    log.info("Update: [%s] %s – %s", entry.provider, entry.region, entry.title)
+    _apply_updates(conn, rec, [update], dry_run)
+    rec.update(title=entry.title, summary=entry.summary)
+
+
 def _regions(region: str) -> set[str]:
     return set(region.split(", "))
 
@@ -256,6 +279,7 @@ def poll_once(dry_run: bool = False) -> tuple[int, int]:
     all_entries, azure_listed, hetzner_listed = fetch_all(errors)
     created = 0
     resolved = 0
+    updated = 0
 
     try:
         with db.get_conn() as conn:
@@ -278,6 +302,9 @@ def poll_once(dry_run: bool = False) -> tuple[int, int]:
                                         feed_updated=entry.updated, added_updates=0)
                     _resolve_incident(conn, rec, entry, dry_run)
                     resolved += 1
+                elif entry.guid in open_incidents and _changed(open_incidents[entry.guid], entry):
+                    _update_from_stable(conn, open_incidents[entry.guid], entry, dry_run)
+                    updated += 1
 
             for provider in GROUPED_PROVIDERS:
                 new, done = _process_grouped(
@@ -324,8 +351,8 @@ def poll_once(dry_run: bool = False) -> tuple[int, int]:
     except Exception:
         pass
 
-    log.info("Cycle complete: %d new, %d resolved, %d still open",
-             created, resolved, open_count)
+    log.info("Cycle complete: %d new, %d updated, %d resolved, %d still open",
+             created, updated, resolved, open_count)
     return created, resolved
 
 
