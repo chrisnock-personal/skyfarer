@@ -2,7 +2,7 @@
 notifiers.py
 ~~~~~~~~~~~~
 Sends incident notices to Zendesk, ServiceNow, Jira Service Management,
-Pushover, PagerDuty, Microsoft
+Freshdesk, Pushover, PagerDuty, Microsoft
 Teams, SNMP trap receivers and any number of outbound webhooks.
 
 Notices go through the `notifications` table, one row per channel. A poll cycle
@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
 import re
@@ -47,6 +48,14 @@ def servicenow_url(instance: str) -> str:
     if not instance or "://" in instance:
         return instance
     return f"https://{instance}.service-now.com"
+
+
+def freshdesk_url(domain: str) -> str:
+    """FRESHDESK_DOMAIN is a helpdesk name ("yourcompany") or its full URL."""
+    domain = domain.strip().rstrip("/")
+    if not domain or "://" in domain:
+        return domain
+    return f"https://{domain}.freshdesk.com"
 
 
 def jsm_url(site: str) -> str:
@@ -103,6 +112,9 @@ def configure(webhooks: Optional[list[Webhook]] = None) -> None:
     global SNMP_TRAP_TARGETS, SNMP_COMMUNITY, SNMP_BASE_OID, WEBHOOKS
     global JSM_URL, JSM_EMAIL, JSM_API_TOKEN, JSM_PROJECT, JSM_REQUEST_TYPE, JSM_RESOLVE
     global JSM_TRANSITION, JSM_EXTRA_FIELDS_RAW
+    global FRESHDESK_URL, FRESHDESK_API_KEY, FRESHDESK_REQUESTER, FRESHDESK_PRIORITY
+    global FRESHDESK_GROUP_ID_RAW, FRESHDESK_TAGS, FRESHDESK_RESOLVE, FRESHDESK_RESOLVED_STATUS
+    global FRESHDESK_EXTRA_FIELDS_RAW
 
     NOTIFY_EVENTS = _env_list("NOTIFY_EVENTS", "opened,resolved")
     NOTIFY_MAX_AGE_HOURS = _env_float("NOTIFY_MAX_AGE_HOURS", 24)
@@ -140,6 +152,16 @@ def configure(webhooks: Optional[list[Webhook]] = None) -> None:
     JSM_RESOLVE = os.getenv("JSM_RESOLVE", "true").lower() in ("1", "true", "yes")
     JSM_TRANSITION = os.getenv("JSM_TRANSITION", "").strip() or "Resolve"
     JSM_EXTRA_FIELDS_RAW = os.getenv("JSM_EXTRA_FIELDS", "")
+
+    FRESHDESK_URL = freshdesk_url(os.getenv("FRESHDESK_DOMAIN", ""))
+    FRESHDESK_API_KEY = os.getenv("FRESHDESK_API_KEY", "")
+    FRESHDESK_REQUESTER = os.getenv("FRESHDESK_REQUESTER_EMAIL", "").strip()
+    FRESHDESK_PRIORITY = os.getenv("FRESHDESK_PRIORITY", "") or "2"
+    FRESHDESK_GROUP_ID_RAW = os.getenv("FRESHDESK_GROUP_ID", "").strip()
+    FRESHDESK_TAGS = _env_list("FRESHDESK_TAGS", "skyfarer,auto-raised")
+    FRESHDESK_RESOLVE = os.getenv("FRESHDESK_RESOLVE", "true").lower() in ("1", "true", "yes")
+    FRESHDESK_RESOLVED_STATUS = os.getenv("FRESHDESK_RESOLVED_STATUS", "") or "4"
+    FRESHDESK_EXTRA_FIELDS_RAW = os.getenv("FRESHDESK_EXTRA_FIELDS", "")
 
     PUSHOVER_API_URL = os.getenv("PUSHOVER_API_URL", "https://api.pushover.net/1/messages.json")
     PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
@@ -531,6 +553,111 @@ def send_jsm(row: dict) -> Optional[dict]:
     return None
 
 
+# ─── Freshdesk ──────────────────────────────────────────────────────────────
+
+FRESHDESK_STATUSES = {"4": "Resolved", "5": "Closed"}
+
+
+def _fd_kwargs() -> dict:
+    # Freshdesk's API key is the user name; the password is ignored.
+    return {"auth": (FRESHDESK_API_KEY, "X"), "headers": {"Accept": "application/json"}}
+
+
+def _fd_check(resp: requests.Response) -> None:
+    """As _check, but a refused request says why: Freshdesk lists each field
+    at fault, such as one your helpdesk requires before a ticket can close."""
+    if resp.ok:
+        return
+    if resp.status_code >= 500 or resp.status_code in (401, 403, 429):
+        raise RetryLater(f"HTTP {resp.status_code}")
+    try:
+        body = resp.json()
+        detail = "; ".join(f"{e.get('field', '')}: {e.get('message', '')}".strip(": ")
+                           for e in body.get("errors") or []) or body.get("description", "")
+    except (ValueError, AttributeError):
+        detail = ""
+    raise PermanentFailure(f"HTTP {resp.status_code}" + (f": {detail}"[:300] if detail else ""))
+
+
+def _fd_html(text: str) -> str:
+    """Freshdesk bodies are HTML: escape the provider's text, keep its lines."""
+    return html.escape(text).replace("\n", "<br>")
+
+
+def _fd_extra_fields() -> dict:
+    """FRESHDESK_EXTRA_FIELDS: a JSON object of more ticket fields, such as
+    {"type": "Incident"} or {"custom_fields": {"cf_service": "Cloud"}}."""
+    if not FRESHDESK_EXTRA_FIELDS_RAW.strip():
+        return {}
+    value = json.loads(FRESHDESK_EXTRA_FIELDS_RAW)
+    if not isinstance(value, dict):
+        raise ValueError("not a JSON object")
+    return value
+
+
+def freshdesk_ticket(row: dict) -> dict:
+    n = row["payload"]
+    description = (
+        f"Provider: {n['provider']}\n"
+        f"Region: {n['region']}\n"
+        f"Status page: {n['link']}\n\n"
+        f"Incident published: {n['published']}\n"
+        f"Last updated: {n['updated']}\n"
+        f"Detected by Skyfarer: {n['noticed']}\n\n"
+        f"{n['summary']}"
+    )
+    ticket = {"subject": _subject(row)[:255], "description": _fd_html(description),
+              "email": FRESHDESK_REQUESTER, "status": 2, "priority": int(FRESHDESK_PRIORITY),
+              "source": 2, "tags": FRESHDESK_TAGS}
+    if FRESHDESK_GROUP_ID_RAW.isdigit():
+        ticket["group_id"] = int(FRESHDESK_GROUP_ID_RAW)
+    ticket.update(_fd_extra_fields())
+    return ticket
+
+
+def freshdesk_note(row: dict) -> dict:
+    n = row["payload"]
+    count = n.get("update_count", 1)
+    heading = (f"{count} new updates from {n['provider']}" if count > 1
+               else f"New update from {n['provider']}")
+    return {"body": _fd_html(f"{heading} (published {n['published']})\n{n['link']}\n\n"
+                             f"{n['title']}\n\n{n['summary']}"), "private": True}
+
+
+def _fd_closing_note(row: dict) -> dict:
+    n = row["payload"]
+    text = (f"{n['provider']} reports this incident resolved "
+            f"(feed updated {n['updated']}, detected {n['noticed']}).\n"
+            f"{n['link']}\n\n{n['summary']}")
+    if not FRESHDESK_RESOLVE:
+        text += "\n\nLeft open for manual review and closure."
+    return {"body": _fd_html(text), "private": True}
+
+
+def send_freshdesk(row: dict) -> Optional[dict]:
+    """Returns {"ref": id, "number": "#id"} when a ticket is created."""
+    base = f"{FRESHDESK_URL}/api/v2/tickets"
+    if row["event"] == "opened":
+        resp = _request("POST", base, json=freshdesk_ticket(row), **_fd_kwargs())
+        _fd_check(resp)
+        ticket_id = resp.json().get("id")
+        if not ticket_id:
+            raise PermanentFailure("no ticket id in the response")
+        return {"ref": str(ticket_id), "number": f"#{ticket_id}"}
+
+    ticket_id = row.get("ticket_ref")
+    if not ticket_id:
+        raise PermanentFailure("incident has no Freshdesk ticket")
+    note = freshdesk_note(row) if row["event"] == "updated" else _fd_closing_note(row)
+    resp = _request("POST", f"{base}/{ticket_id}/notes", json=note, **_fd_kwargs())
+    _fd_check(resp)
+    if row["event"] == "resolved" and FRESHDESK_RESOLVE:
+        resp = _request("PUT", f"{base}/{ticket_id}",
+                        json={"status": int(FRESHDESK_RESOLVED_STATUS)}, **_fd_kwargs())
+        _fd_check(resp)
+    return None
+
+
 # ─── Pushover ───────────────────────────────────────────────────────────────
 
 def pushover_message(row: dict) -> dict:
@@ -781,6 +908,7 @@ SENDERS: dict[str, Callable[[dict], object]] = {
     "zendesk": send_zendesk,
     "servicenow": send_servicenow,
     "jsm": send_jsm,
+    "freshdesk": send_freshdesk,
     "pushover": send_pushover,
     "pagerduty": send_pagerduty,
     "teams": send_teams,
@@ -789,7 +917,7 @@ SENDERS: dict[str, Callable[[dict], object]] = {
 
 # Ticketing systems keep a record of every incident, old ones and maintenance
 # included, and get every event; the others are alert channels.
-TICKET_CHANNELS = ("zendesk", "servicenow", "jsm")
+TICKET_CHANNELS = ("zendesk", "servicenow", "jsm", "freshdesk")
 
 # PagerDuty alerts have no "update" action: an event would just re-trigger.
 CHANNEL_EVENTS = {
@@ -814,6 +942,8 @@ def enabled_channels() -> list[str]:
         channels.append("servicenow")
     if JSM_URL and JSM_EMAIL and JSM_API_TOKEN and JSM_PROJECT:
         channels.append("jsm")
+    if FRESHDESK_URL and FRESHDESK_API_KEY and FRESHDESK_REQUESTER:
+        channels.append("freshdesk")
     if PUSHOVER_TOKEN and PUSHOVER_USER:
         channels.append("pushover")
     if PAGERDUTY_ROUTING_KEY:
@@ -854,6 +984,21 @@ def config_errors() -> list[str]:
         _jsm_extra_fields()
     except ValueError as exc:
         errors.append(f"Jira Service Management extra fields must be a JSON object: {exc}")
+    fd = (FRESHDESK_URL, FRESHDESK_API_KEY, FRESHDESK_REQUESTER)
+    if any(fd) and not all(fd):
+        errors.append("Freshdesk needs a domain, an API key and a requester email")
+    if FRESHDESK_REQUESTER and "@" not in FRESHDESK_REQUESTER:
+        errors.append(f"The Freshdesk requester must be an email address, not {FRESHDESK_REQUESTER!r}")
+    if FRESHDESK_PRIORITY not in ("1", "2", "3", "4"):
+        errors.append(f"Freshdesk priority must be 1 to 4, not {FRESHDESK_PRIORITY!r}")
+    if FRESHDESK_RESOLVED_STATUS not in FRESHDESK_STATUSES:
+        errors.append(f"Freshdesk's resolved status must be 4 or 5, not {FRESHDESK_RESOLVED_STATUS!r}")
+    if FRESHDESK_GROUP_ID_RAW and not FRESHDESK_GROUP_ID_RAW.isdigit():
+        errors.append(f"The Freshdesk group ID must be a number, not {FRESHDESK_GROUP_ID_RAW!r}")
+    try:
+        _fd_extra_fields()
+    except ValueError as exc:
+        errors.append(f"Freshdesk extra fields must be a JSON object: {exc}")
     if bool(PUSHOVER_TOKEN) != bool(PUSHOVER_USER):
         errors.append("Pushover needs both an application token and a user key")
     if PUSHOVER_PRIORITY not in ("-2", "-1", "0", "1", "2"):

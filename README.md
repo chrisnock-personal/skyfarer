@@ -8,14 +8,19 @@
 **Skyfarer** keeps watch over the clouds you run on. It polls the public status
 pages of AWS, Azure, Google Cloud, OVHcloud, DigitalOcean, Hetzner, Linode,
 Cloudflare and Scaleway for incidents and maintenance in the regions you care
-about. It raises Zendesk tickets, ServiceNow incidents or Jira Service Management
-requests and sends Pushover,
-PagerDuty, Microsoft Teams, SNMP trap and webhook notifications, then follows
-up when the provider marks the incident clear.
+about. It raises Zendesk, ServiceNow, Jira Service Management or Freshdesk
+tickets and sends Pushover, PagerDuty, Microsoft Teams, SNMP trap and webhook
+notifications, keeps the tickets up to date as the provider posts, then
+follows up when the provider marks the incident clear.
 
 Providers, regions, channels and their keys are set in the dashboard, by
 admins; viewers see the dashboard only. Everything is held in **Postgres**,
 and the whole stack runs in Docker Compose.
+
+For an illustrated tour of every feature, see the
+[project overview](https://github.com/chrisnock-personal/project-overviews/blob/main/skyfarer/README.md).
+
+![The Skyfarer dashboard: summary tiles, a card per provider, delivery channel health and recent poll cycles](docs/images/hero.png)
 
 
 ## Quick start
@@ -74,7 +79,8 @@ light, and the browser remembers the choice. It shows:
   cycles with failures marked
 - The `incidents` table: live incidents first, then maintenance under way,
   then upcoming work (soonest first). Filter by state (Active / Resolved /
-  All) and provider; Zendesk and ServiceNow ticket numbers link to the ticket
+  All) and provider; ticket numbers link to the ticket in Zendesk, ServiceNow,
+  Jira or Freshdesk
 - The last 50 notifications, with their status, attempts and any error
 - The last 50 rows of `poll_log`, with errors called out
 - Full-text search across incident title, summary, region, provider, and
@@ -84,6 +90,8 @@ light, and the browser remembers the choice. It shows:
   tables
 
 The page auto-refreshes every 30 seconds. Admins also see **Settings**.
+
+![Delivery channel health, and the poll cycle chart with failed feed reads marked](docs/images/health.png)
 
 ## Settings and accounts
 
@@ -96,16 +104,20 @@ dashboard:
   losing its regions. Regions are added as tags, with suggestions of common
   codes, and there's the keyword filter and the poll interval.
 - **Channels.** The alert rules (which events, how old is too old, how long to
-  retry, maintenance), then Zendesk, ServiceNow, Pushover, PagerDuty, Teams and
-  SNMP, plus Jira Service Management, each with its own switch, editor and
-  test button. A test uses the saved
-  settings: a ServiceNow test creates a record and resolves it, a Zendesk test
-  opens a ticket and sets it to pending.
+  retry, maintenance), then Zendesk, ServiceNow, Jira Service Management,
+  Freshdesk, Pushover, PagerDuty, Teams and SNMP, each with its own switch,
+  editor and test button. A test uses the saved settings: a ServiceNow, Jira or
+  Freshdesk test creates a ticket and resolves it, a Zendesk test opens a
+  ticket and sets it to pending.
 - **Webhooks.** Any number, each with its own URL, method, events, template,
   headers and signing secret.
 - **Users and access.** Admins see and change everything; viewers see the
   dashboard and nothing under Settings. There's always at least one admin, and
   nobody can change their own role.
+
+![Settings > Providers and regions: a card per provider with its feed status, region tags, suggestions and a switch](docs/images/settings-providers.png)
+
+![Settings > Channels: alert rules, the ticket and alert channels with their status, and two webhooks](docs/images/settings-channels.png)
 
 **How changes take effect.** The poller reloads the settings at the start of
 every poll, so a change applies within one poll interval, without a restart.
@@ -120,6 +132,8 @@ whom each was set, and offers to replace or remove it. Keep the secret key with
 your backups: without it, the stored secrets can't be decrypted and have to be
 entered again.
 
+![The ServiceNow editor: a stored password with a Replace button, and the result of a test ticket](docs/images/servicenow-editor.png)
+
 **Accounts.** On the first visit with no accounts, the dashboard asks for a
 setup code that it prints to its own log, so whoever reaches the page first
 can't take the admin account. Further people are added by an admin, who gets a
@@ -132,6 +146,12 @@ session cookie is then only sent over HTTPS, and the dashboard takes the
 client's address, scheme and host from the proxy's `X-Forwarded-*` headers (for
 setup links and the sign-in throttle). Leave it unset without a proxy, so
 those headers aren't trusted. The dashboard runs under gunicorn.
+
+![Users and access: the two roles, the people, and the change history](docs/images/users.png)
+
+A viewer sees the dashboard without the Settings link:
+
+![The dashboard header for a viewer: no Settings link](docs/images/viewer.png)
 
 **Change history.** Every change is recorded with who made it and when,
 including switches, regions added and removed, and users added or removed.
@@ -192,9 +212,9 @@ Records in ticketing systems other than Zendesk, whose ticket number is
 | Column | Type | Notes |
 |--------|------|-------|
 | incident_id | integer | FK to `incidents.id` |
-| system | text | `servicenow` |
-| ref | text | the system's own ID (a ServiceNow `sys_id`) |
-| number | text | what people call it (`INC0010001`) |
+| system | text | `servicenow`, `jsm` or `freshdesk` |
+| ref | text | the system's own ID (a ServiceNow `sys_id`, a Jira key, a Freshdesk ticket ID) |
+| number | text | what people call it (`INC0010001`, `ITSM-12`, `#42`) |
 | created_at | timestamptz | when it was created |
 
 ### `notifications`
@@ -239,14 +259,15 @@ One row per poll cycle -useful for spotting gaps or failures.
 
 ```
 Feed entry appears         → row inserted (state=open), notices queued,
-                             Zendesk ticket / ServiceNow record / Jira request
+                             Zendesk / ServiceNow / Jira / Freshdesk ticket
 Provider posts an update   → stored with the incident, row shows it,
                              "updated" notices queued: a ticket note (and an
                              alert, if NOTIFY_EVENTS includes updated)
 Resolved status found      → row → resolved, notices queued,
                              Zendesk note + ticket → pending,
                              ServiceNow work note + record → Resolved,
-                             Jira comment + Resolve transition
+                             Jira comment + Resolve transition,
+                             Freshdesk note + status → Resolved
 Operator reviews & closes  → manual step in Zendesk; ServiceNow auto-closes
 ```
 
@@ -311,10 +332,10 @@ that name no watched region are logged, as are entries with no parseable date.
 
 ## Notifications
 
-Seven channels plus any number of webhooks, each set up under Settings >
+Eight channels plus any number of webhooks, each set up under Settings >
 Channels (or in `.env` before the first start). Any can run alone. Zendesk,
-ServiceNow and Jira Service Management are the ticketing channels; the rest
-alert people and systems. The
+ServiceNow, Jira Service Management and Freshdesk are the ticketing channels;
+the rest alert people and systems. The
 settings column gives each setting's name in `.env` and in the database.
 
 | Channel | What it sends | Settings |
@@ -322,13 +343,14 @@ settings column gives each setting's name in `.env` and in the database.
 | Zendesk | A ticket, internal notes for updates, pending when resolved | `ZENDESK_*`, `ZD_TICKET_*` |
 | ServiceNow | A record in the `incident` table through the Table API, work notes for updates, Resolved (with a close code) when the incident ends | `SERVICENOW_*` |
 | Jira Service Management | A request in a service desk through its REST API, internal comments for updates, resolved through a workflow transition when the incident ends | `JSM_*` |
+| Freshdesk | A ticket from a requester email you choose, private notes for updates, status Resolved (or Closed) when the incident ends | `FRESHDESK_*` |
 | Pushover | A push message per event, with a link to the status page | `PUSHOVER_TOKEN`, `PUSHOVER_USER`, `PUSHOVER_PRIORITY` |
 | PagerDuty | An Events API v2 alert, resolved automatically when the incident ends | `PAGERDUTY_ROUTING_KEY`, `PAGERDUTY_SEVERITY` |
 | Microsoft Teams | An Adaptive Card, posted to a Workflows webhook | `TEAMS_WEBHOOK_URL` |
 | SNMP traps | A v2c trap to each receiver, defined in `SKYFARER-MIB.txt` | `SNMP_TRAP_TARGETS`, `SNMP_COMMUNITY`, `SNMP_BASE_OID` |
 | Webhooks | A request to any URL, with a JSON document or a body of your own | One per webhook, under Settings; `WEBHOOK_*` in `.env` describes the first |
 
-**What reaches the channels that interrupt people.** Zendesk and ServiceNow
+**What reaches the channels that interrupt people.** The ticketing channels
 record every incident. The other channels skip incidents published more than
 `NOTIFY_MAX_AGE_HOURS` ago (24) and scheduled maintenance
 (`NOTIFY_MAINTENANCE`), so a first start doesn't page anyone for what's already
@@ -346,7 +368,7 @@ Notices for one incident on one channel stay in order.
 |--------|--------------|
 | Network error, HTTP 5xx | Retried with growing gaps, up to an hour apart, for `NOTIFY_RETRY_HOURS` (24) |
 | HTTP 429 | The same, except Pushover, whose rules say not to retry a 4xx |
-| HTTP 401, 403 from Zendesk, ServiceNow or Jira | The same, so tickets survive an expired token or password |
+| HTTP 401, 403 from a ticketing channel | The same, so tickets survive an expired token or password |
 | Other HTTP 4xx | Marked failed, not retried |
 
 **ServiceNow.** Records are created through the Table API (`/api/now/table/incident`
@@ -377,6 +399,19 @@ shows. `JSM_EXTRA_FIELDS` adds request fields, such as
 `{"priority": {"name": "High"}}`. Tested against a real Jira Service Management
 Cloud site with the IT service management template, where `Resolve` moves a
 request to Completed.
+
+![The Jira Service Management editor, with the site name and account email blurred](docs/images/jsm-editor.png)
+
+**Freshdesk.** Tickets are created through the v2 API with an agent's API key
+(`FRESHDESK_API_KEY`, from the agent's profile settings), from the requester
+`FRESHDESK_REQUESTER_EMAIL`, such as `skyfarer@yourcompany.com`, which
+Freshdesk adds as a contact. Priority, group, tags and any other fields
+(`FRESHDESK_EXTRA_FIELDS`, such as `{"type": "Incident"}`) are settings.
+Updates are private notes; when the incident ends, Skyfarer adds a private note
+and sets the status to Resolved, or Closed with `FRESHDESK_RESOLVED_STATUS=5`.
+If your helpdesk requires fields before a ticket can be resolved, Freshdesk's
+refusal names them, and the test button shows it. So far only tested against a
+stand-in for the API.
 
 **Webhooks.** For anything else: a chat tool, an on-call service, an automation
 platform or your own system, as many as you need. Each sends its own requests,
@@ -552,7 +587,8 @@ Covers each channel's payload against its published limits, which failures
 retry, what gets queued for which channel, delivery order, and settings checks,
 plus region matching and parsing for the Statuspage and Hetzner feeds (from
 trimmed copies of real payloads), and how stored settings reach the poller,
-switches, secret encryption and the change history's wording. They need no
+switches, secret encryption, the change history's wording, and updates on
+providers with a stable incident ID. They need no
 database or network.
 
 ## .env reference

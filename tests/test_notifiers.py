@@ -355,6 +355,83 @@ class JiraServiceManagement(unittest.TestCase):
             self.assertTrue(any("Jira" in e for e in notifiers.config_errors()))
 
 
+class Freshdesk(unittest.TestCase):
+    def setUp(self):
+        settings = {"FRESHDESK_URL": "https://acme.freshdesk.com", "FRESHDESK_API_KEY": "key",
+                    "FRESHDESK_REQUESTER": "skyfarer@example.test", "FRESHDESK_PRIORITY": "3",
+                    "FRESHDESK_GROUP_ID_RAW": "", "FRESHDESK_TAGS": ["skyfarer"],
+                    "FRESHDESK_RESOLVE": True, "FRESHDESK_RESOLVED_STATUS": "4",
+                    "FRESHDESK_EXTRA_FIELDS_RAW": ""}
+        for name, value in settings.items():
+            p = mock.patch.object(notifiers, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def send(self, r, *responses):
+        with mock.patch.object(notifiers, "_request", side_effect=list(responses)) as req:
+            result = notifiers.send_freshdesk(r)
+        return result, req.call_args_list
+
+    def test_url(self):
+        self.assertEqual(notifiers.freshdesk_url("acme"), "https://acme.freshdesk.com")
+        self.assertEqual(notifiers.freshdesk_url("https://support.example.test/"), "https://support.example.test")
+
+    def test_opens_a_ticket(self):
+        r = row()
+        r["payload"]["summary"] = "Errors <b>up</b>\nsecond line"
+        result, calls = self.send(r, response(201, b'{"id": 42}'))
+        self.assertEqual(result, {"ref": "42", "number": "#42"})
+        (method, url), kwargs = calls[0].args, calls[0].kwargs
+        self.assertEqual((method, url), ("POST", "https://acme.freshdesk.com/api/v2/tickets"))
+        t = kwargs["json"]
+        self.assertEqual((t["email"], t["priority"], t["status"], t["tags"]),
+                         ("skyfarer@example.test", 3, 2, ["skyfarer"]))
+        self.assertIn("Errors &lt;b&gt;up&lt;/b&gt;<br>second line", t["description"])
+        self.assertLessEqual(len(t["subject"]), 255)
+        self.assertNotIn("group_id", t)
+        self.assertEqual(kwargs["auth"], ("key", "X"))
+
+    def test_group_and_extra_fields(self):
+        with mock.patch.object(notifiers, "FRESHDESK_GROUP_ID_RAW", "77"), \
+                mock.patch.object(notifiers, "FRESHDESK_EXTRA_FIELDS_RAW", '{"type": "Incident"}'):
+            _, calls = self.send(row(), response(201, b'{"id": 1}'))
+        t = calls[0].kwargs["json"]
+        self.assertEqual((t["group_id"], t["type"]), (77, "Incident"))
+
+    def test_update_is_a_private_note(self):
+        _, calls = self.send(row("updated", ticket_ref="42"), response(201))
+        self.assertTrue(calls[0].args[1].endswith("/tickets/42/notes"))
+        self.assertIs(calls[0].kwargs["json"]["private"], True)
+
+    def test_resolve_notes_then_sets_the_status(self):
+        _, calls = self.send(row("resolved", ticket_ref="42"), response(201), response(200))
+        self.assertTrue(calls[0].args[1].endswith("/tickets/42/notes"))
+        self.assertEqual((calls[1].args[0], calls[1].args[1]), ("PUT", "https://acme.freshdesk.com/api/v2/tickets/42"))
+        self.assertEqual(calls[1].kwargs["json"], {"status": 4})
+        with mock.patch.object(notifiers, "FRESHDESK_RESOLVE", False):
+            _, calls = self.send(row("resolved", ticket_ref="42"), response(201))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("manual review", calls[0].kwargs["json"]["body"])
+
+    def test_refusals_name_the_field(self):
+        body = b'{"description": "Validation failed", "errors": [{"field": "type", "message": "It should be one of these values: Incident,Problem", "code": "invalid_value"}]}'
+        with self.assertRaises(notifiers.PermanentFailure) as caught:
+            self.send(row("resolved", ticket_ref="42"), response(201), response(400, body))
+        self.assertIn("type: It should be one of these values", str(caught.exception))
+        for status in (401, 429, 503):
+            with self.assertRaises(notifiers.RetryLater):
+                self.send(row(), response(status))
+
+    def test_config_errors(self):
+        self.assertEqual([e for e in notifiers.config_errors() if "Freshdesk" in e], [])
+        self.assertIn("freshdesk", notifiers.enabled_channels())
+        for name, value in (("FRESHDESK_API_KEY", ""), ("FRESHDESK_REQUESTER", "nobody"),
+                            ("FRESHDESK_PRIORITY", "9"), ("FRESHDESK_RESOLVED_STATUS", "3"),
+                            ("FRESHDESK_GROUP_ID_RAW", "sales"), ("FRESHDESK_EXTRA_FIELDS_RAW", "[]")):
+            with mock.patch.object(notifiers, name, value):
+                self.assertTrue(any("Freshdesk" in e for e in notifiers.config_errors()), name)
+
+
 class Webhook(unittest.TestCase):
     def hook(self, **fields):
         return notifiers.Webhook(**{"id": 3, "name": "Test", "url": "https://hooks.example.test/in",

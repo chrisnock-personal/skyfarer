@@ -156,6 +156,21 @@ CHANNELS = (
         Field("JSM_EXTRA_FIELDS", "Extra fields (JSON)", "json", wide=True,
               help='Added to every new request, such as {"priority": {"name": "High"}}.'),
     )),
+    Channel("freshdesk", "Freshdesk", "tickets", (
+        Field("FRESHDESK_DOMAIN", "Helpdesk", help="The part before .freshdesk.com, or the full URL."),
+        Field("FRESHDESK_API_KEY", "API key", "secret", help="An agent's key, from their profile settings."),
+        Field("FRESHDESK_REQUESTER_EMAIL", "Requester email",
+              help="Who tickets come from, such as skyfarer@yourcompany.com. Freshdesk adds them as a contact."),
+        Field("FRESHDESK_PRIORITY", "Priority", "select", default="2",
+              options=(("1", "Low"), ("2", "Medium"), ("3", "High"), ("4", "Urgent"))),
+        Field("FRESHDESK_GROUP_ID", "Group ID", help="Optional. A number from Admin > Groups."),
+        Field("FRESHDESK_TAGS", "Tags", "list", default="skyfarer,auto-raised"),
+        Field("FRESHDESK_RESOLVE", "Change the status when the incident ends", "bool", default="true"),
+        Field("FRESHDESK_RESOLVED_STATUS", "Status when it ends", "select", default="4",
+              options=(("4", "Resolved"), ("5", "Closed"))),
+        Field("FRESHDESK_EXTRA_FIELDS", "Extra fields (JSON)", "json", wide=True,
+              help='Added to every new ticket, such as {"type": "Incident"}.'),
+    )),
     Channel("pushover", "Pushover", "alerts", (
         Field("PUSHOVER_TOKEN", "Application token", "secret"),
         Field("PUSHOVER_USER", "User or group key", "secret"),
@@ -549,7 +564,7 @@ def import_summary(found: dict[str, str], webhook: bool) -> str:
     regions = sum(len(split_list(found[p.key])) for p in providers)
     channels = [c.name for c in CHANNELS if any(found.get(f.key) for f in c.fields
                                                  if f.kind == "secret" or f.key.endswith(
-                                                     ("_SUBDOMAIN", "_INSTANCE", "_SITE", "_TARGETS")))]
+                                                     ("_SUBDOMAIN", "_INSTANCE", "_SITE", "_DOMAIN", "_TARGETS")))]
     if webhook:
         channels.append("a webhook")
     if not providers and not channels:
