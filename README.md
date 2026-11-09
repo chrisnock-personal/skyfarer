@@ -597,3 +597,7 @@ See `.env.example` for the full list with comments. Apart from
 `SKYFARER_SECRET_KEY`, Postgres, the dashboard's address and the feed URLs,
 those settings are read once, on the first start, and imported into the
 database; after that, change them in the dashboard.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
