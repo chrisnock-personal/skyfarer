@@ -27,13 +27,15 @@ import api_errors
 import db
 import history
 import notifiers
+import oidc
 import settings
 
 log = logging.getLogger("skyfarer.dashboard")
 
 bp = Blueprint("admin", __name__)
 
-OPEN_ENDPOINTS = {"admin.login", "admin.setup", "admin.welcome"}
+OPEN_ENDPOINTS = {"admin.login", "admin.setup", "admin.welcome",
+                  "admin.oidc_login", "admin.oidc_callback"}
 ALWAYS_OPEN = {"static", "healthz"}
 
 FAILURE_LIMIT = 5
@@ -119,8 +121,11 @@ def guard():
             abort(400, "The form has expired. Go back, reload the page and try again.")
     with db.get_conn() as conn:
         _ensure_bootstrapped(conn)
-        settings.apply(conn)
-        if settings.user_count(conn) == 0:
+        # apply() already loaded every value; keep them for the login page's
+        # "sign in with SSO" check instead of reading them a second time.
+        g.settings_values = settings.apply(conn)
+        g.has_users = settings.user_count(conn) > 0
+        if not g.has_users:
             if request.endpoint != "admin.setup":
                 return redirect(url_for("admin.setup"))
             return None
@@ -155,6 +160,17 @@ def _actor() -> str:
     return g.user["name"] if g.get("user") else "Skyfarer"
 
 
+def _oidc_available() -> bool:
+    """Only offer SSO once there is an account and the settings would work."""
+    if not g.get("has_users"):
+        return False
+    try:
+        oidc.require_config(g.get("settings_values") or {})
+        return True
+    except oidc.OidcError:
+        return False
+
+
 # ─── Signing in ─────────────────────────────────────────────────────────────
 
 @bp.route("/login", methods=["GET", "POST"])
@@ -164,6 +180,7 @@ def login():
     error = None
     email = request.form.get("email", "").strip()
     nxt = _safe_next(request.values.get("next"))
+    oidc_available = _oidc_available()
     if request.method == "POST":
         user = None
         bucket = f"{request.remote_addr}|{email.lower()}"
@@ -183,7 +200,98 @@ def login():
         if user:
             _sign_in(user["id"])
             return redirect(nxt)
-    return render_template("login.html", error=error, email=email, next=nxt)
+    return render_template("login.html", error=error, email=email, next=nxt,
+                           oidc_available=oidc_available)
+
+
+@bp.get("/oidc/login")
+def oidc_login():
+    """Start the authorization-code flow, with PKCE and an anti-replay state."""
+    nxt = _safe_next(request.args.get("next"))
+    with db.get_conn() as conn:
+        values = settings.load(conn)
+        try:
+            meta = oidc.discovery(values)
+        except oidc.OidcError as err:
+            flash(str(err), "bad")
+            return redirect(url_for("admin.login", next=nxt))
+    verifier, state, nonce = (secrets.token_urlsafe(48), secrets.token_urlsafe(32),
+                              secrets.token_urlsafe(32))
+    callback_url = oidc.redirect_uri(values, url_for("admin.oidc_callback", _external=True))
+    session["oidc_state"] = state
+    session["oidc_nonce"] = nonce
+    session["oidc_verifier"] = verifier
+    session["oidc_redirect_uri"] = callback_url
+    session["oidc_next"] = nxt
+    log.info("Starting OIDC sign-in with %s", values["OIDC_ISSUER"].strip())
+    return redirect(oidc.authorization_url(values, state=state, nonce=nonce,
+                                           verifier=verifier, redirect=callback_url, meta=meta))
+
+
+@bp.get("/oidc/callback")
+def oidc_callback():
+    """Finish the flow: exchange the code, verify the token, map the role."""
+    nxt = _safe_next(session.pop("oidc_next", None) or request.args.get("next"))
+    state = session.get("oidc_state", "")
+    verifier = session.pop("oidc_verifier", "")
+    nonce = session.pop("oidc_nonce", "")
+    callback_url = session.pop("oidc_redirect_uri", "")
+    session.pop("oidc_state", None)
+    if request.args.get("error"):
+        flash(f"The identity provider refused the sign-in: "
+              f"{request.args['error']}.", "bad")
+        return redirect(url_for("admin.login", next=nxt))
+    code = request.args.get("code", "")
+    if not state or not verifier or not nonce or not code \
+            or not secrets.compare_digest(state, request.args.get("state", "")):
+        flash("The sign-in request expired or was altered. Try again.", "bad")
+        return redirect(url_for("admin.login", next=nxt))
+
+    with db.get_conn() as conn:
+        values = settings.load(conn)
+        try:
+            meta = oidc.discovery(values)
+            tokens = oidc.exchange_code(values, code, verifier, callback_url, meta)
+            claims = oidc.identity(values, tokens, nonce, meta)
+            role = oidc.role_for(claims, values)
+            if role is None:
+                raise oidc.OidcError("This account isn't mapped to a Skyfarer role.")
+            email = str(claims["email"]).strip().lower()
+            sub_id = oidc.subject(claims)
+            person = settings.user_by_email(conn, email)
+            if person:
+                if person["kind"] == "service":
+                    raise oidc.OidcError("Service accounts can't sign in. Use a "
+                                         "human account for single sign-on.")
+                linked = person.get("oidc_subject")
+                if linked and linked != sub_id:
+                    raise oidc.OidcError("This Skyfarer account is linked to a "
+                                         "different single sign-on identity.")
+                if not linked and not oidc.truthy(
+                        values.get("OIDC_REQUIRE_VERIFIED_EMAIL"), True):
+                    # An unverified email is only a claim: it mustn't open
+                    # an existing account, such as the first admin's.
+                    raise oidc.OidcError("Existing accounts can only be linked to "
+                                         "single sign-on when verified emails are "
+                                         "required.")
+                user_id = person["id"]
+                if person["role"] != role:
+                    reason = settings.set_role(conn, user_id, role, "SSO")
+                    if reason:
+                        raise oidc.OidcError(reason)
+            else:
+                if not oidc.truthy(values.get("OIDC_CREATE_USERS"), True):
+                    raise oidc.OidcError("An admin must add your account before "
+                                         "you can use single sign-on.")
+                user_id = settings.create_user(conn, email, oidc.display_name(claims),
+                                               role, "SSO", sso=True).user_id
+            settings.record_sso_login(conn, user_id, sub_id)
+        except oidc.OidcError as err:
+            flash(str(err), "bad")
+            return redirect(url_for("admin.login", next=nxt))
+    log.info("Signed in %s through OIDC as %s", email, role)
+    _sign_in(user_id)
+    return redirect(nxt)
 
 
 @bp.post("/logout")
@@ -372,6 +480,59 @@ def providers():
                            secrets=secrets, unreadable=unreadable,
                            api_help={f.key: f.help for f in settings.PROVIDER_API_KEY_FIELDS},
                            last_poll=last[0] if last else None)
+
+
+# ─── Settings: single sign-on ───────────────────────────────────────────────
+
+@bp.route("/settings/sso", methods=["GET", "POST"])
+def sso():
+    with db.get_conn() as conn:
+        unreadable: set = set()
+        values = settings.load(conn, unreadable)
+        errors: list[str] = []
+        if request.method == "POST":
+            form = request.form
+            proposed = {}
+            for f in settings.OIDC_FIELDS:
+                if f.kind == "bool":
+                    proposed[f.key] = "true" if form.get(f.key) else "false"
+                elif f.kind == "list":
+                    proposed[f.key] = settings.join_list(
+                        settings.split_list(form.get(f.key, "")))
+                elif f.kind == "secret":
+                    if form.get(f"remove_{f.key}"):
+                        proposed[f.key] = None
+                    elif form.get(f.key, "").strip():
+                        proposed[f.key] = form[f.key].strip()
+                else:
+                    proposed[f.key] = form.get(f.key, "").strip()
+            baseline = set(settings.check(conn, {}))
+            errors = [e for e in settings.check(conn, proposed) if e not in baseline]
+            # Show sign-in problems even if this page is where they're fixed:
+            # the shared check hides pre-existing errors so other pages can
+            # still save unrelated changes.
+            trial = dict(values)
+            for key, value in proposed.items():
+                if value is None:
+                    trial.pop(key, None)
+                else:
+                    trial[key] = value
+            if oidc.enabled(trial):
+                try:
+                    oidc.require_config(trial)
+                except oidc.OidcError as err:
+                    errors.append(str(err))
+            errors = list(dict.fromkeys(errors))
+            if not errors:
+                lines = settings.save(conn, _changes(values, proposed), _actor())
+                _saved_message(conn, lines)
+                return redirect(url_for("admin.sso"))
+        secrets = settings.secret_meta(conn)
+    return render_template("settings_sso.html", errors=errors,
+                           fields={f.key: f for f in settings.OIDC_FIELDS},
+                           field_list=settings.OIDC_FIELDS,
+                           values=values, effective=effective,
+                           secrets=secrets, unreadable=unreadable)
 
 
 # ─── Settings: SLA targets ──────────────────────────────────────────────────
