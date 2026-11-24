@@ -117,20 +117,29 @@ history like any other setting. Nothing here changes polling or alerting.
 
 ## API and CLI
 
-Skyfarer has a read-only JSON API at `/api/v1` for scripts, the CLI and agents.
-`GET /api/v1/openapi.json` serves the machine-readable contract; the endpoints
-are `status`, `incidents` (list and detail), `history`, `deliveries` and
-`poll-log`. Lists are cursor-paginated (50 by default, 200 maximum) and
-timestamps are ISO 8601. Errors are `application/problem+json` with a `detail`
-and, where useful, per-field `errors`.
+Skyfarer has a JSON API at `/api/v1` for scripts, the CLI and agents.
+`GET /api/v1/openapi.json` serves the machine-readable contract (no token
+needed). Read endpoints are `status`, `incidents` (list and detail), `history`,
+`deliveries` and `poll-log`; admin endpoints cover `settings`, `providers`,
+`channels` (including test), `rules`, `webhooks`, `users`, `tokens` and
+`bootstrap`. They call the same helpers as the HTML settings pages, so the two
+views can't drift apart. Secrets are write-only: GET returns field names,
+labels and configured flags, never values. Lists are cursor-paginated (50 by
+default, 200 maximum), timestamps are ISO 8601, and errors are
+`application/problem+json` with a `detail` and per-field `errors`.
 
-Every API request needs `Authorization: Bearer <token>`; cookie sessions are
-not accepted. Admins create tokens under **Settings > API tokens**, naming what
-they're for and choosing scopes such as `incidents:read` or `history:read`.
-A token is shown once and stored only as a SHA-256 hash. It acts as its user,
-so a viewer's token can never write anything even if given a write scope.
-For automation, create a *service account* (no password, no sign-in) to own the
-token. Revoke a token from the same page; its `last_used_at` is recorded.
+Every endpoint other than `openapi.json` and `bootstrap` needs
+`Authorization: Bearer <token>`; cookie sessions are not accepted. Admins
+create tokens under **Settings > API tokens**, naming what they're for and
+choosing scopes such as `incidents:read` or `settings:write`. A token is shown
+once and stored only as a SHA-256 hash. It acts as its user, so a viewer's token
+can never write anything even if given a write scope; admin endpoints check the
+role again on every request. For automation, create a *service account* (no
+password, no sign-in) to own the token. Revoke a token from the same page; its
+`last_used_at` is recorded. Requests are throttled per token and per client IP
+(120 and 300 per minute by default), with `429` and `Retry-After` when exceeded;
+`SKYFARER_API_RATE_LIMIT` and `SKYFARER_API_IP_RATE_LIMIT` change the limits.
+Counters are in Postgres, so several dashboard workers share them.
 
 ```sh
 export SKYFARER_URL=http://192.168.1.195:8083
@@ -139,15 +148,32 @@ skyfarer status
 skyfarer incidents list --state open --json
 skyfarer history --range quarter --csv report.csv
 skyfarer incidents list --fail-on-open  # exit 7 while anything is open
+skyfarer providers set --name OVH --regions GRA SBG
+skyfarer channels test zendesk
+skyfarer webhooks add --name Ops --url https://example.com/hook
+skyfarer users add --name Deploy --email deploy@example.test --kind service
+skyfarer tokens create --name CI --user-id 4 --scopes incidents:read history:read
+skyfarer settings set POLL_INTERVAL_SECONDS=60 --clear ZENDESK_API_TOKEN
 ```
 
 The `skyfarer` command is installed in the container image, or with
-`pipx install .` from the repo. Use `--profile`, `--url` and `--token` to
-override the config file. Tables are printed by default; `--json` gives stable
-output for scripts. Exit codes are 0 (ok), 2 (usage/connection), 3 (auth),
-4 (permission), 5 (not found), 6 (conflict), 7 (open incident found) and
-8 (rate limited or partial failure). Admin write endpoints are planned; see
-the design on [issue #7](https://github.com/chrisnock-personal/skyfarer/issues/7).
+`pipx install .` from the repo. It also has `providers|channels|webhooks|users|
+tokens|settings|rules` subcommands and `deliveries`/`poll-log`. Use `--profile`,
+`--url` and `--token` to override the config file
+(`~/.config/skyfarer/config.toml`, with `[profiles.NAME]` sections). Tables are
+printed by default; `--json` gives stable output for scripts. Exit codes are 0
+(ok), 2 (usage/connection), 3 (auth), 4 (permission), 5 (not found), 6
+(conflict), 7 (open incident found) and 8 (rate limited or a test failed).
+
+For an unattended first install, set `SKYFARER_BOOTSTRAP_ADMIN_NAME`,
+`SKYFARER_BOOTSTRAP_ADMIN_EMAIL` and either
+`SKYFARER_BOOTSTRAP_ADMIN_PASSWORD` (the admin can sign in immediately) or
+`SKYFARER_BOOTSTRAP_ADMIN_TOKEN` (a bearer token is minted and the admin gets a
+setup link to choose a browser password). They only act when `users` is empty;
+the browser `/setup` flow is unchanged. `skyfarer bootstrap` does the same
+against a running, uninitialised instance using `SKYFARER_BOOTSTRAP_SECRET` as
+`X-Bootstrap-Secret`. See the design on
+[issue #7](https://github.com/chrisnock-personal/skyfarer/issues/7).
 
 ## Settings and accounts
 

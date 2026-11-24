@@ -690,10 +690,10 @@ API_TOKEN_PREFIX = "sk_live_"
 
 
 def create_api_token(conn, user_id: int, name: str, scopes: list[str],
-                     actor: str) -> tuple[int, str]:
+                     actor: str, *, plaintext: Optional[str] = None) -> tuple[int, str]:
     """Create a bearer token. Only its hash is stored; the plaintext is
     returned once for the caller to show."""
-    plaintext = API_TOKEN_PREFIX + secrets.token_urlsafe(32)
+    plaintext = plaintext or API_TOKEN_PREFIX + secrets.token_urlsafe(32)
     with conn.cursor() as cur:
         cur.execute("""INSERT INTO api_tokens (user_id, name, token_hash, scopes)
                        VALUES (%s, %s, %s, %s) RETURNING id""",
@@ -701,6 +701,15 @@ def create_api_token(conn, user_id: int, name: str, scopes: list[str],
         token_id = cur.fetchone()[0]
     history_add(conn, actor, f"Created API token {name.strip()}")
     return token_id, plaintext
+
+
+def api_token_by_id(conn, token_id: int) -> Optional[dict]:
+    rows = _rows(conn, """SELECT t.id, t.user_id, t.name, t.scopes, t.created_at,
+                                 t.last_used_at, t.revoked_at IS NOT NULL AS revoked,
+                                 u.email AS user_email
+                            FROM api_tokens t JOIN users u ON u.id = t.user_id
+                           WHERE t.id = %s""", (token_id,))
+    return rows[0] if rows else None
 
 
 def api_tokens(conn) -> list[dict]:
@@ -791,3 +800,55 @@ def delete_user(conn, user_id: int, actor: str) -> Optional[str]:
         cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
     history_add(conn, actor, f"Removed {target['name']}")
     return None
+
+
+# ─── Headless first install ─────────────────────────────────────────────────
+
+BOOTSTRAP_SCOPES = ("status:read", "incidents:read", "history:read", "deliveries:read",
+                    "poll-log:read", "settings:read", "settings:write", "channels:test",
+                    "users:write", "tokens:write")
+
+
+def headless_bootstrap(conn, supplied: Optional[dict] = None,
+                       actor: str = "Skyfarer") -> Optional[dict]:
+    """Create the first admin from the environment, or from explicit values
+    sent by `skyfarer bootstrap`. Never touches an instance that has users.
+
+    With PASSWORD the admin can sign in at once. With TOKEN a bearer token of
+    that value is minted and the admin gets a setup link to choose a browser
+    password later. Both secrets are logged only as a "created" notice.
+    """
+    values = supplied or {
+        "name": os.getenv("SKYFARER_BOOTSTRAP_ADMIN_NAME", ""),
+        "email": os.getenv("SKYFARER_BOOTSTRAP_ADMIN_EMAIL", ""),
+        "password": os.getenv("SKYFARER_BOOTSTRAP_ADMIN_PASSWORD", ""),
+        "token": os.getenv("SKYFARER_BOOTSTRAP_ADMIN_TOKEN", ""),
+    }
+    name = (values.get("name") or "").strip()
+    email = (values.get("email") or "").strip()
+    password = values.get("password") or ""
+    token = values.get("token") or ""
+    if not name or "@" not in email or (not password and not token):
+        return None
+    if password:
+        problem = password_problem(password)
+        if problem:
+            raise ValueError(problem)
+    # Workers racing on a fresh database must not each claim an admin.
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(77704)")
+    if user_count(conn):
+        return None
+    new = create_user(conn, email, name, "admin", actor,
+                      password=password or None)
+    result = {"user_id": new.user_id, "email": email.lower(),
+              "setup_token": None if password else new.token,
+              "api_token": None}
+    if token:
+        _, plaintext = create_api_token(conn, new.user_id, "Bootstrap",
+                                        list(BOOTSTRAP_SCOPES), actor, plaintext=token)
+        result["api_token"] = plaintext
+    log.info("First admin created headlessly for %s (password: %s, API token: %s)",
+             email.lower(), "yes" if password else "setup link",
+             "yes" if token else "no")
+    return result

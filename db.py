@@ -12,6 +12,7 @@ notifications     – delivery queue: one row per notice per channel
 poll_log          – one row per poll cycle for observability
 settings, webhooks, users, settings_log – see settings.py
 api_tokens         – hashed bearer tokens for the JSON API
+api_rate_limits    – short-lived request counters shared by every worker
 """
 
 from __future__ import annotations
@@ -173,6 +174,15 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens (user_id);
 
+-- API throttle: one row per request, pruned as it ages out of the window.
+CREATE TABLE IF NOT EXISTS api_rate_limits (
+    id              BIGSERIAL PRIMARY KEY,
+    bucket          TEXT NOT NULL,             -- token id or client address
+    at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_api_rate_limits_bucket ON api_rate_limits (bucket, at);
+CREATE INDEX IF NOT EXISTS idx_api_rate_limits_at ON api_rate_limits (at);
+
 -- Who changed what. Secret values are never written here.
 CREATE TABLE IF NOT EXISTS settings_log (
     id              SERIAL PRIMARY KEY,
@@ -208,6 +218,26 @@ def init_schema():
                            TEXT NOT NULL DEFAULT 'human'
                            CHECK (kind IN ('human', 'service'))""")
     log.info("Database schema initialised")
+
+
+def api_rate_limit(conn, bucket: str, limit: int, window: int = 60) -> tuple[bool, int]:
+    """Count this request in a shared, fixed-window throttle.
+
+    The advisory lock keeps concurrent workers from each allowing their own
+    quota. Returns (allowed, retry_after_seconds).
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(77705, hashtext(%s))", (bucket,))
+        cur.execute("DELETE FROM api_rate_limits WHERE at < NOW() - %s * INTERVAL '1 second'",
+                    (window,))
+        cur.execute("""SELECT COUNT(*), MIN(at) FROM api_rate_limits WHERE bucket = %s""",
+                    (bucket,))
+        count, oldest = cur.fetchone()
+        if count >= limit:
+            left = (datetime.now(timezone.utc) - oldest).total_seconds()
+            return False, max(1, int(window - left) + 1)
+        cur.execute("INSERT INTO api_rate_limits (bucket) VALUES (%s)", (bucket,))
+        return True, 0
 
 
 def get_known_guids(conn) -> set[str]:

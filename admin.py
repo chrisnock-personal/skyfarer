@@ -12,6 +12,7 @@ claim the admin account.
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import time
 from collections import defaultdict, deque
@@ -41,7 +42,20 @@ _setup_code: list[str] = []
 _failures: dict[str, deque] = defaultdict(deque)
 FAILURE_LIMIT = 5
 FAILURE_WINDOW = 15 * 60
+API_RATE_WINDOW = 60
+API_TOKEN_LIMIT = int(os.getenv("SKYFARER_API_RATE_LIMIT", "120"))
+API_IP_LIMIT = int(os.getenv("SKYFARER_API_IP_RATE_LIMIT", "300"))
 _bootstrapped: list[bool] = []
+
+
+def _ensure_bootstrapped(conn) -> None:
+    """Import .env settings once, then create the first admin if the
+    environment asks for one. Safe when several workers start together."""
+    if _bootstrapped:
+        return
+    settings.bootstrap()
+    settings.headless_bootstrap(conn)
+    _bootstrapped.append(True)
 
 
 # ─── Guard: every request ───────────────────────────────────────────────────
@@ -60,7 +74,7 @@ def _template_globals():
 def _api_guard():
     """Bearer auth for /api/v1. Kept in the shared guard so the API and the
     HTML pages resolve the same user, role and settings on every request."""
-    if request.endpoint == "api.openapi":
+    if request.endpoint in ("api.openapi", "api.bootstrap"):
         return None
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer ") or not header[7:].strip():
@@ -68,9 +82,7 @@ def _api_guard():
                                   code="missing-token",
                                   headers={"WWW-Authenticate": "Bearer"})
     with db.get_conn() as conn:
-        if not _bootstrapped:
-            settings.bootstrap()
-            _bootstrapped.append(True)
+        _ensure_bootstrapped(conn)
         settings.apply(conn)
         if settings.user_count(conn) == 0:
             return api_errors.problem(503, "Skyfarer has no accounts yet; run setup first.",
@@ -80,6 +92,12 @@ def _api_guard():
             return api_errors.problem(401, "That API token is invalid or revoked.",
                                       code="bad-token",
                                       headers={"WWW-Authenticate": "Bearer"})
+        for bucket, limit in ((f"token:{record['token_id']}", API_TOKEN_LIMIT),
+                              (f"ip:{request.remote_addr}", API_IP_LIMIT)):
+            allowed, retry = db.api_rate_limit(conn, bucket, limit, API_RATE_WINDOW)
+            if not allowed:
+                return api_errors.problem(429, "Too many requests. Slow down and try again.",
+                                          code="rate-limited", headers={"Retry-After": str(retry)})
         settings.touch_api_token(conn, record["token_id"])
     g.user = {k: record[k] for k in ("id", "email", "name", "role", "kind")}
     g.api_token = record["token_id"]
@@ -99,9 +117,7 @@ def guard():
         if not sent or not secrets.compare_digest(sent, session.get("csrf", "")):
             abort(400, "The form has expired. Go back, reload the page and try again.")
     with db.get_conn() as conn:
-        if not _bootstrapped:
-            settings.bootstrap()
-            _bootstrapped.append(True)
+        _ensure_bootstrapped(conn)
         settings.apply(conn)
         if settings.user_count(conn) == 0:
             if request.endpoint != "admin.setup":
