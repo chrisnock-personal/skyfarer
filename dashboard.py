@@ -31,6 +31,7 @@ import history  # noqa: E402
 import notifiers  # noqa: E402
 import settings  # noqa: E402
 from admin import bp as admin_bp  # noqa: E402
+from api import bp as api_bp  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s  %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S")
@@ -446,14 +447,12 @@ def index():
     )
 
 
-@app.get("/history")
-def history_page():
-    """History & SLA: the stored incident timeline shown as availability,
-    error budgets and a per-provider breakdown."""
-    range_key = request.args.get("range", "quarter")
+def history_context(range_key="quarter", from_date="", to_date="",
+                    provider="all", region="all") -> dict:
+    """Build the History report. Shared by the HTML page and the JSON API."""
     range_key = range_key if range_key in dict(history.RANGES) else "quarter"
-    from_date = request.args.get("from", "").strip()
-    to_date = request.args.get("to", "").strip()
+    from_date = (from_date or "").strip()
+    to_date = (to_date or "").strip()
     start, end = history.window(range_key, from_date, to_date)
 
     rows = _query("""
@@ -471,8 +470,6 @@ def history_page():
     region_names = sorted({r.strip() for regions in watched.values() for r in regions}
                           | {r.strip() for row in rows
                              for r in (row["region"] or "").split(",") if r.strip()})
-    provider = request.args.get("provider", "all")
-    region = request.args.get("region", "all")
     provider = provider if provider == "all" or provider in provider_names else "all"
     region = region if region == "all" or region in region_names else "all"
 
@@ -487,9 +484,27 @@ def history_page():
     targets = {name: history.target_value(values, name) for name in in_view}
     report = history.build(rows, start, end, targets,
                            provider=provider, region=region, now=end)
+    return {"report": report, "range_key": range_key, "from_date": from_date,
+            "to_date": to_date, "provider": provider, "region": region,
+            "provider_names": provider_names, "region_names": region_names}
+
+
+@app.get("/history")
+def history_page():
+    """History & SLA: the stored incident timeline shown as availability,
+    error budgets and a per-provider breakdown."""
+    context = history_context(request.args.get("range", "quarter"),
+                              request.args.get("from", ""), request.args.get("to", ""),
+                              request.args.get("provider", "all"),
+                              request.args.get("region", "all"))
+    report = context["report"]
+    range_key, from_date, to_date = (context["range_key"], context["from_date"],
+                                     context["to_date"])
+    provider, region = context["provider"], context["region"]
+    provider_names, region_names = context["provider_names"], context["region_names"]
 
     if request.args.get("format") == "csv":
-        filename = f"skyfarer-history-{end:%Y%m%d}.csv"
+        filename = f"skyfarer-history-{report['end']:%Y%m%d}.csv"
         return Response(history.csv_export(report), mimetype="text/csv; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
@@ -523,6 +538,7 @@ def healthz():
 
 app.config["CHANNEL_HEALTH"] = fetch_channels
 app.register_blueprint(admin_bp)
+app.register_blueprint(api_bp)
 
 
 def configure_app() -> None:

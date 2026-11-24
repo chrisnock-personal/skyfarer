@@ -1,0 +1,266 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Skyfarer API",
+    "version": "1.0.0",
+    "description": "JSON view of Skyfarer for scripts, the CLI and agents. Read endpoints need a bearer token with the matching scope; admin endpoints also need an admin account. Secrets are write-only: GET returns field names and configured flags, never values. Lists use cursor pagination (50 by default, 200 maximum). Errors are application/problem+json. Requests are throttled per token and per IP (429 with Retry-After)."
+  },
+  "servers": [{"url": "/api/v1"}],
+  "security": [{"bearerAuth": []}],
+  "tags": [
+    {"name": "read", "description": "Available to viewers and admins"},
+    {"name": "admin", "description": "Admin account and write scope required"},
+    {"name": "install", "description": "First-run bootstrap"}
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http", "scheme": "bearer",
+        "description": "Token from Settings > API tokens, shown once at creation and stored only as a hash."
+      },
+      "bootstrapSecret": {
+        "type": "apiKey", "in": "header", "name": "X-Bootstrap-Secret",
+        "description": "Value of SKYFARER_BOOTSTRAP_SECRET on the server."
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing, revoked or invalid token",
+        "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+      },
+      "Forbidden": {
+        "description": "Missing scope or admin role",
+        "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+      },
+      "NotModified": {"description": "Nothing changed"}
+    },
+    "schemas": {
+      "Problem": {
+        "type": "object",
+        "properties": {
+          "type": {"type": "string"}, "title": {"type": "string"},
+          "status": {"type": "integer"}, "detail": {"type": "string"},
+          "errors": {"type": "array", "items": {"type": "object"}}
+        }
+      },
+      "Page": {
+        "type": "object",
+        "properties": {
+          "items": {"type": "array", "items": {"type": "object"}},
+          "next_cursor": {"type": ["integer", "null"]}
+        }
+      },
+      "Field": {
+        "type": "object",
+        "properties": {
+          "key": {"type": "string"}, "label": {"type": "string"},
+          "kind": {"type": "string"}, "secret": {"type": "boolean"},
+          "value": {"type": ["string", "null"]}, "configured": {"type": "boolean"},
+          "unreadable": {"type": "boolean"}
+        }
+      },
+      "Channel": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"}, "name": {"type": "string"},
+          "enabled": {"type": "boolean"}, "summary": {"type": "string"},
+          "fields": {"type": "array", "items": {"$ref": "#/components/schemas/Field"}}
+        }
+      },
+      "Webhook": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"}, "name": {"type": "string"},
+          "url": {"type": "string"}, "method": {"type": "string"},
+          "events": {"type": "array", "items": {"type": "string"}},
+          "enabled": {"type": "boolean"}, "headers_configured": {"type": "boolean"},
+          "secret_configured": {"type": "boolean"}
+        }
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"}, "email": {"type": "string"},
+          "name": {"type": "string"}, "role": {"enum": ["admin", "viewer"]},
+          "kind": {"enum": ["human", "service"]}
+        }
+      },
+      "Token": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"}, "name": {"type": "string"},
+          "user_id": {"type": "integer"}, "scopes": {"type": "array", "items": {"type": "string"}},
+          "token": {"type": "string", "description": "Plaintext, returned once at creation"},
+          "revoked": {"type": "boolean"}
+        }
+      }
+    }
+  },
+  "paths": {
+    "/openapi.json": {
+      "get": {"tags": ["read"], "security": [], "summary": "This document (no token needed)",
+              "responses": {"200": {"description": "OpenAPI document"}}}
+    },
+    "/status": {
+      "get": {"tags": ["read"], "summary": "Summary, providers, channel health and poll bars",
+              "responses": {"200": {"description": "Current status"},
+                            "401": {"$ref": "#/components/responses/Unauthorized"}}}
+    },
+    "/incidents": {
+      "get": {"tags": ["read"], "summary": "List incidents, newest detected first",
+              "parameters": [
+                {"name": "state", "in": "query", "schema": {"type": "string", "default": "open", "enum": ["all", "open", "resolved"]}},
+                {"name": "provider", "in": "query", "schema": {"type": "string", "default": "all"}},
+                {"name": "region", "in": "query", "schema": {"type": "string"}},
+                {"name": "q", "in": "query", "schema": {"type": "string"}},
+                {"name": "range", "in": "query", "schema": {"type": "string", "default": "all"}},
+                {"name": "from", "in": "query", "schema": {"type": "string", "format": "date"}},
+                {"name": "to", "in": "query", "schema": {"type": "string", "format": "date"}},
+                {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50, "maximum": 200}},
+                {"name": "cursor", "in": "query", "schema": {"type": "integer"}}
+              ],
+              "responses": {"200": {"description": "Page of incidents", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}},
+                            "401": {"$ref": "#/components/responses/Unauthorized"}}}
+    },
+    "/incidents/{id}": {
+      "get": {"tags": ["read"], "summary": "One incident with updates, tickets and deliveries",
+              "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+              "responses": {"200": {"description": "Incident"}, "404": {"description": "Not found"}}}
+    },
+    "/history": {
+      "get": {"tags": ["read"], "summary": "Availability and SLA report, as JSON or CSV",
+              "parameters": [
+                {"name": "range", "in": "query", "schema": {"type": "string", "default": "quarter", "enum": ["30d", "quarter", "year", "custom"]}},
+                {"name": "from", "in": "query", "schema": {"type": "string", "format": "date"}},
+                {"name": "to", "in": "query", "schema": {"type": "string", "format": "date"}},
+                {"name": "provider", "in": "query", "schema": {"type": "string", "default": "all"}},
+                {"name": "region", "in": "query", "schema": {"type": "string", "default": "all"}},
+                {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["csv"]}}
+              ],
+              "responses": {"200": {"description": "Report"}, "401": {"$ref": "#/components/responses/Unauthorized"}}}
+    },
+    "/deliveries": {
+      "get": {"tags": ["read"], "summary": "Notification deliveries",
+              "parameters": [
+                {"name": "channel", "in": "query", "schema": {"type": "string"}},
+                {"name": "status", "in": "query", "schema": {"type": "string"}},
+                {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
+                {"name": "cursor", "in": "query", "schema": {"type": "integer"}}
+              ],
+              "responses": {"200": {"description": "Page of deliveries"}}}
+    },
+    "/poll-log": {
+      "get": {"tags": ["read"], "summary": "Poll cycles",
+              "parameters": [
+                {"name": "range", "in": "query", "schema": {"type": "string", "default": "all"}},
+                {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
+                {"name": "cursor", "in": "query", "schema": {"type": "integer"}}
+              ],
+              "responses": {"200": {"description": "Page of poll cycles"}}}
+    },
+    "/settings": {
+      "get": {"tags": ["admin"], "summary": "Settings metadata; secrets never have values",
+              "responses": {"200": {"description": "Groups of fields"},
+                            "403": {"$ref": "#/components/responses/Forbidden"}}},
+      "put": {"tags": ["admin"], "summary": "Set or clear settings (null clears)",
+              "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                "type": "object", "properties": {"values": {"type": "object"}}}}}},
+              "responses": {"200": {"description": "Change history lines"},
+                            "400": {"description": "Invalid settings"},
+                            "403": {"$ref": "#/components/responses/Forbidden"}}}
+    },
+    "/providers": {
+      "get": {"tags": ["admin"], "summary": "Providers, enabled flags and watched regions",
+              "responses": {"200": {"description": "Providers"}}},
+      "put": {"tags": ["admin"], "summary": "Set providers, filter keywords and poll interval",
+              "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                "type": "object", "properties": {"items": {"type": "array", "items": {"type": "object"}}}}}}},
+              "responses": {"200": {"description": "Change history lines"}}}
+    },
+    "/channels": {
+      "get": {"tags": ["admin"], "summary": "Built-in channels with field metadata",
+              "responses": {"200": {"description": "Channels"}}},
+      "post": {"tags": ["admin"], "summary": "Save a channel's settings",
+               "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                 "type": "object", "required": ["id"],
+                 "properties": {"id": {"type": "string"}, "enabled": {"type": "boolean"}, "values": {"type": "object"}}}}}},
+               "responses": {"201": {"description": "Saved"}, "400": {"description": "Invalid settings"}}}
+    },
+    "/channels/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+      "get": {"tags": ["admin"], "summary": "One channel",
+              "responses": {"200": {"description": "Channel", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Channel"}}}},
+                            "404": {"description": "Not found"}}},
+      "patch": {"tags": ["admin"], "summary": "Change channel fields or enabled state",
+                "responses": {"200": {"description": "Saved"}, "404": {"description": "Not found"}}},
+      "delete": {"tags": ["admin"], "summary": "Clear a channel's settings and switch it off",
+                 "responses": {"200": {"description": "Cleared"}}}
+    },
+    "/channels/{id}/test": {
+      "post": {"tags": ["admin"], "summary": "Send a test through the saved channel settings",
+               "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+               "responses": {"200": {"description": "ok and message"}}}
+    },
+    "/rules": {
+      "put": {"tags": ["admin"], "summary": "Set the alert rules (fields left out keep their setting)",
+              "responses": {"200": {"description": "Change history lines"}}}
+    },
+    "/webhooks": {
+      "get": {"tags": ["admin"], "summary": "Webhooks (headers and secret shown as configured flags)",
+              "responses": {"200": {"description": "Webhooks"}}},
+      "post": {"tags": ["admin"], "summary": "Add a webhook",
+               "responses": {"201": {"description": "Webhook", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Webhook"}}}},
+                             "400": {"description": "Invalid webhook"}}}
+    },
+    "/webhooks/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+      "get": {"tags": ["admin"], "summary": "One webhook",
+              "responses": {"200": {"description": "Webhook"}, "404": {"description": "Not found"}}},
+      "patch": {"tags": ["admin"], "summary": "Edit a webhook (blank secrets keep the old value)",
+                "responses": {"200": {"description": "Webhook"}}},
+      "delete": {"tags": ["admin"], "summary": "Delete a webhook",
+                 "responses": {"200": {"description": "Deleted"}}}
+    },
+    "/webhooks/{id}/test": {
+      "post": {"tags": ["admin"], "summary": "Send a test to this webhook",
+               "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+               "responses": {"200": {"description": "ok and message"}}}
+    },
+    "/users": {
+      "get": {"tags": ["admin"], "summary": "Accounts and service accounts",
+              "responses": {"200": {"description": "Users"}}},
+      "post": {"tags": ["admin"], "summary": "Add an account or a passwordless service account",
+               "responses": {"201": {"description": "User and, for a person, a setup URL"},
+                             "409": {"description": "Email already in use"}}}
+    },
+    "/users/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+      "get": {"tags": ["admin"], "summary": "One account",
+              "responses": {"200": {"description": "User"}, "404": {"description": "Not found"}}},
+      "patch": {"tags": ["admin"], "summary": "Change the role or issue a new setup link",
+                "responses": {"200": {"description": "Updated"}}},
+      "delete": {"tags": ["admin"], "summary": "Remove an account and its tokens",
+                 "responses": {"200": {"description": "Deleted"}}}
+    },
+    "/tokens": {
+      "get": {"tags": ["admin"], "summary": "Token metadata (never hashes)",
+              "responses": {"200": {"description": "Tokens"}}},
+      "post": {"tags": ["admin"], "summary": "Create a token; plaintext is shown only here",
+               "responses": {"201": {"description": "Token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Token"}}}}}}
+    },
+    "/tokens/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+      "get": {"tags": ["admin"], "summary": "Token metadata",
+              "responses": {"200": {"description": "Token"}, "404": {"description": "Not found"}}},
+      "delete": {"tags": ["admin"], "summary": "Revoke a token",
+                 "responses": {"200": {"description": "Revoked"}}}
+    },
+    "/bootstrap": {
+      "post": {"tags": ["install"], "security": [{"bootstrapSecret": []}],
+               "summary": "Create the first admin on an empty instance (no bearer token)",
+               "responses": {"201": {"description": "Admin created"},
+                             "401": {"description": "Missing bootstrap secret"},
+                             "409": {"description": "Already installed"}}}
+    }
+  }
+}

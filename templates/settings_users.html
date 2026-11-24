@@ -70,7 +70,7 @@
             </form>
             {% endif %}
           </td>
-          <td class="sub {{ 'tone-warn' if not p.active }}">{{ p.last }}</td>
+          <td class="sub {{ 'tone-warn' if not p.active and not p.service }}">{{ 'Service account — no sign-in' if p.service else p.last }}</td>
           <td style="text-align: right; white-space: nowrap">
             {% if you %}<span class="hint">You</span>{% else %}
             <form method="post" action="{{ url_for('admin.user_link', user_id=p.id) }}">

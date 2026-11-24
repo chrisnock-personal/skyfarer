@@ -12,6 +12,7 @@ claim the admin account.
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -21,6 +22,8 @@ import psycopg2
 from flask import (Blueprint, abort, current_app, flash, g, redirect, render_template,
                    request, session, url_for)
 
+import api
+import api_errors
 import db
 import history
 import notifiers
@@ -35,7 +38,25 @@ ALWAYS_OPEN = {"static", "healthz"}
 
 FAILURE_LIMIT = 5
 FAILURE_WINDOW = 15 * 60
+API_RATE_WINDOW = 60
+API_TOKEN_LIMIT = int(os.getenv("SKYFARER_API_RATE_LIMIT", "120"))
+API_IP_LIMIT = int(os.getenv("SKYFARER_API_IP_RATE_LIMIT", "300"))
 _bootstrapped: list[bool] = []
+
+
+def _ensure_bootstrapped(conn) -> None:
+    """Import .env settings once, then create the first admin if the
+    environment asks for one. Safe when several workers start together."""
+    if _bootstrapped:
+        return
+    settings.bootstrap()
+    try:
+        settings.headless_bootstrap(conn)
+    except ValueError as exc:
+        # A weak SKYFARER_BOOTSTRAP_ADMIN_PASSWORD mustn't take the whole
+        # dashboard down: say why, and leave the setup page to do it instead.
+        log.error("SKYFARER_BOOTSTRAP_ADMIN_PASSWORD wasn't used: %s", exc)
+    _bootstrapped.append(True)
 
 
 # ─── Guard: every request ───────────────────────────────────────────────────
@@ -51,9 +72,45 @@ def _template_globals():
     return {"csrf_token": csrf_token, "current_user": g.get("user")}
 
 
+def _api_guard():
+    """Bearer auth for /api/v1. Kept in the shared guard so the API and the
+    HTML pages resolve the same user, role and settings on every request."""
+    if request.endpoint in ("api.openapi", "api.bootstrap"):
+        return None
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer ") or not header[7:].strip():
+        return api_errors.problem(401, "Send a bearer token in Authorization.",
+                                  code="missing-token",
+                                  headers={"WWW-Authenticate": "Bearer"})
+    with db.get_conn() as conn:
+        _ensure_bootstrapped(conn)
+        settings.apply(conn)
+        if settings.user_count(conn) == 0:
+            return api_errors.problem(503, "Skyfarer has no accounts yet; run setup first.",
+                                      code="not-installed")
+        record = settings.api_token(conn, header[7:].strip())
+        if record is None:
+            return api_errors.problem(401, "That API token is invalid or revoked.",
+                                      code="bad-token",
+                                      headers={"WWW-Authenticate": "Bearer"})
+        for bucket, limit in ((f"token:{record['token_id']}", API_TOKEN_LIMIT),
+                              (f"ip:{request.remote_addr}", API_IP_LIMIT)):
+            allowed, retry = db.api_rate_limit(conn, bucket, limit, API_RATE_WINDOW)
+            if not allowed:
+                return api_errors.problem(429, "Too many requests. Slow down and try again.",
+                                          code="rate-limited", headers={"Retry-After": str(retry)})
+        settings.touch_api_token(conn, record["token_id"])
+    g.user = {k: record[k] for k in ("id", "email", "name", "role", "kind")}
+    g.api_token = record["token_id"]
+    g.api_scopes = set(record["scopes"] or [])
+    return None
+
+
 @bp.before_app_request
 def guard():
     g.user = None
+    if request.path.startswith("/api/v1"):
+        return _api_guard()
     if request.endpoint in ALWAYS_OPEN or request.endpoint is None:
         return None
     if request.method == "POST":
@@ -61,9 +118,7 @@ def guard():
         if not sent or not secrets.compare_digest(sent, session.get("csrf", "")):
             abort(400, "The form has expired. Go back, reload the page and try again.")
     with db.get_conn() as conn:
-        if not _bootstrapped:
-            settings.bootstrap()
-            _bootstrapped.append(True)
+        _ensure_bootstrapped(conn)
         settings.apply(conn)
         if settings.user_count(conn) == 0:
             if request.endpoint != "admin.setup":
@@ -713,6 +768,66 @@ def webhook_test(hook_id: int):
     ok, message = run_test(channel)
     flash(message, f"test:{channel}:{'ok' if ok else 'bad'}")
     return redirect(url_for("admin.channels", open=channel) + f"#ch-{channel}")
+
+
+# ─── Settings: API tokens ───────────────────────────────────────────────────
+
+@bp.get("/settings/tokens")
+def tokens(new_token: str = "", error: str = ""):
+    with db.get_conn() as conn:
+        rows = settings.api_tokens(conn)
+        people = settings.users(conn)
+    return render_template("settings_tokens.html", tokens=rows, people=people,
+                           scopes=api.SCOPES, defaults=api.DEFAULT_SCOPES,
+                           new_token=new_token, error=error)
+
+
+@bp.post("/settings/tokens/new")
+def token_new():
+    form = request.form
+    try:
+        user_id = int(form.get("user_id", ""))
+    except ValueError:
+        return tokens(error="Choose who this token acts as.")
+    name = form.get("name", "").strip()
+    if not name:
+        return tokens(error="Give the token a name so you can recognise it later.")
+    with db.get_conn() as conn:
+        person = settings.user(conn, user_id)
+        if not person:
+            return tokens(error="That user no longer exists.")
+        scopes = [s for s in api.SCOPES if form.get(s)]
+        if person["role"] != "admin":
+            scopes = [s for s in scopes if s in api.READ_SCOPES]
+        if not scopes:
+            scopes = list(api.DEFAULT_SCOPES)
+        _, plaintext = settings.create_api_token(conn, user_id, name, scopes, _actor())
+    return tokens(new_token=plaintext)
+
+
+@bp.post("/settings/tokens/<int:token_id>/revoke")
+def token_revoke(token_id: int):
+    with db.get_conn() as conn:
+        name = settings.revoke_api_token(conn, token_id, _actor())
+    flash(f"Revoked {name}.", "ok" if name else "bad")
+    return redirect(url_for("admin.tokens"))
+
+
+@bp.post("/settings/tokens/service")
+def token_service():
+    form = request.form
+    name, email = form.get("name", "").strip(), form.get("email", "").strip()
+    role = form.get("role", "viewer")
+    if not name or "@" not in email or role not in settings.ROLES:
+        return tokens(error="Enter a name, an email and a role for the service account.")
+    with db.get_conn() as conn:
+        try:
+            settings.create_user(conn, email, name, role, _actor(), kind="service")
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
+            return tokens(error=f"There's already an account for {email}.")
+    flash(f"Added service account {name}. Create a token for it below.", "ok")
+    return redirect(url_for("admin.tokens"))
 
 
 # ─── Settings: users ────────────────────────────────────────────────────────

@@ -11,6 +11,8 @@ incident_updates  – later feed entries about an incident (AWS posts each
 notifications     – delivery queue: one row per notice per channel
 poll_log          – one row per poll cycle for observability
 settings, webhooks, users, settings_log – see settings.py
+api_tokens         – hashed bearer tokens for the JSON API
+api_rate_limits    – short-lived request counters shared by every worker
 dashboard_state, login_failures – shared first-run code and sign-in throttle
 """
 
@@ -176,6 +178,29 @@ CREATE TABLE IF NOT EXISTS users (
     last_login      TIMESTAMPTZ
 );
 
+-- Bearer tokens for the JSON API. The plaintext is shown once at creation;
+-- only its SHA-256 hash is kept. Scopes are a Postgres text array.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id            SERIAL PRIMARY KEY,
+    user_id       INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    token_hash    TEXT NOT NULL UNIQUE,
+    scopes        TEXT[] NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at  TIMESTAMPTZ,
+    revoked_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens (user_id);
+
+-- API throttle: one row per request, pruned as it ages out of the window.
+CREATE TABLE IF NOT EXISTS api_rate_limits (
+    id              BIGSERIAL PRIMARY KEY,
+    bucket          TEXT NOT NULL,             -- token id or client address
+    at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_api_rate_limits_bucket ON api_rate_limits (bucket, at);
+CREATE INDEX IF NOT EXISTS idx_api_rate_limits_at ON api_rate_limits (at);
+
 -- First-run setup code and sign-in throttling live here, not in a worker's
 -- memory, so gunicorn can run several workers (or replicas).
 CREATE TABLE IF NOT EXISTS dashboard_state (
@@ -218,14 +243,39 @@ def get_conn():
 
 
 def init_schema():
-    """Create tables and indexes if they don't exist. Every dashboard worker
-    and the poller run this at start; the lock stops their CREATE TABLE IF NOT
-    EXISTS statements racing, which Postgres can refuse with a unique violation."""
+    """Create tables and indexes if they don't exist, and apply the small
+    column additions that older databases need. Every dashboard worker and the
+    poller run this at start; the lock stops their CREATE TABLE IF NOT EXISTS
+    statements racing, which Postgres can refuse with a unique violation."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(77700)")
             cur.execute(SCHEMA_SQL)
+            # Added for the API's service accounts; safe to run repeatedly.
+            cur.execute("""ALTER TABLE users ADD COLUMN IF NOT EXISTS kind
+                           TEXT NOT NULL DEFAULT 'human'
+                           CHECK (kind IN ('human', 'service'))""")
     log.info("Database schema initialised")
+
+
+def api_rate_limit(conn, bucket: str, limit: int, window: int = 60) -> tuple[bool, int]:
+    """Count this request in a shared, fixed-window throttle.
+
+    The advisory lock keeps concurrent workers from each allowing their own
+    quota. Returns (allowed, retry_after_seconds).
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(77705, hashtext(%s))", (bucket,))
+        cur.execute("DELETE FROM api_rate_limits WHERE at < NOW() - %s * INTERVAL '1 second'",
+                    (window,))
+        cur.execute("""SELECT COUNT(*), MIN(at) FROM api_rate_limits WHERE bucket = %s""",
+                    (bucket,))
+        count, oldest = cur.fetchone()
+        if count >= limit:
+            left = (datetime.now(timezone.utc) - oldest).total_seconds()
+            return False, max(1, int(window - left) + 1)
+        cur.execute("INSERT INTO api_rate_limits (bucket) VALUES (%s)", (bucket,))
+        return True, 0
 
 
 def get_known_guids(conn) -> set[str]:

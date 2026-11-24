@@ -12,9 +12,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY poller.py feeds.py db.py dashboard.py history.py notifiers.py settings.py admin.py wsgi.py ./
+COPY poller.py feeds.py db.py dashboard.py history.py notifiers.py settings.py admin.py api.py api_errors.py cli.py wsgi.py ./
+COPY docs/openapi.json docs/openapi.json
 COPY templates/ templates/
 COPY static/ static/
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir .
 
 # Default: continuous poll loop.  Override with --once or --dry-run.
 ENTRYPOINT ["python", "-u", "poller.py"]
