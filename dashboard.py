@@ -62,7 +62,7 @@ STATE_LABELS = [("open", "Active"), ("resolved", "Resolved"), ("all", "All")]
 PROVIDER_LABELS = {"GCP": "Google Cloud", "OVH": "OVHcloud"}
 CHANNEL_LABELS = {
     "zendesk": "Zendesk", "servicenow": "ServiceNow", "jsm": "Jira Service Management",
-    "freshdesk": "Freshdesk",
+    "freshdesk": "Freshdesk", "freshservice": "Freshservice",
     "pushover": "Pushover", "pagerduty": "PagerDuty",
     "teams": "Microsoft Teams", "snmp": "SNMP traps", "webhook": "Webhook",
 }
@@ -91,6 +91,11 @@ def _query(sql: str, params=()) -> list[dict]:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params)
             return cur.fetchall()
+
+
+def _provider_resources() -> dict[str, dict[str, int]]:
+    with db.get_conn() as conn:
+        return db.provider_resources(conn)
 
 
 def compute_range(range_key: str, from_date: str, to_date: str):
@@ -247,14 +252,17 @@ def fetch_providers(last_poll):
           FROM incidents WHERE state = 'open' GROUP BY provider
     """)}
     errors = _feed_errors(last_poll)
+    found = _provider_resources()
     cards, off = [], []
-    for provider, regions in feeds.watched_regions().items():
+    for provider, regions in feeds.watched_regions(found).items():
         label = PROVIDER_LABELS.get(provider, provider)
         if not regions:
             off.append(label)
             continue
         c = counts.get(provider, {})
-        if provider in errors:
+        if f"{provider} API" in errors:
+            status, tone = f"Account API error ({errors[f'{provider} API']})", "bad"
+        elif provider in errors:
             status, tone = f"Feed unreachable ({errors[provider]})", "bad"
         elif c.get("incidents"):
             n = c["incidents"]
@@ -264,6 +272,8 @@ def fetch_providers(last_poll):
         else:
             status, tone = "Operational", "good"
         cards.append({"name": provider, "label": label, "regions": ", ".join(regions),
+                      "discovered": ", ".join(f"{r} ({n})" for r, n in
+                                              sorted(found.get(provider, {}).items())),
                       "status": status, "tone": tone})
     return cards, off
 
@@ -350,6 +360,9 @@ def _tickets(row) -> list[dict]:
         if t["system"] == "freshdesk":
             tickets.append({"label": t["number"] or f"#{t['ref']}",
                             "url": f"{notifiers.FRESHDESK_URL}/a/tickets/{t['ref']}" if notifiers.FRESHDESK_URL else None})
+        if t["system"] == "freshservice":
+            tickets.append({"label": t["number"] or f"#{t['ref']}",
+                            "url": f"{notifiers.FRESHSERVICE_URL}/a/tickets/{t['ref']}" if notifiers.FRESHSERVICE_URL else None})
         if t["system"] == "jsm":
             tickets.append({"label": t["number"] or t["ref"],
                             "url": f"{notifiers.JSM_URL}/browse/{t['ref']}" if notifiers.JSM_URL else None})
@@ -407,6 +420,8 @@ def index():
         row["duration"] = _duration(row["detected_at"], row["resolved_at"])
         row["provider_label"] = PROVIDER_LABELS.get(row["provider"], row["provider"])
         row["tickets"] = _tickets(row)
+        row["resource_breakdown"] = ", ".join(
+            f"{name}: {count}" for name, count in sorted((row.get("resource_counts") or {}).items()))
     bars, bar_errors = fetch_poll_bars()
 
     return render_template(
@@ -448,7 +463,8 @@ def history_context(range_key="quarter", from_date="", to_date="",
          ORDER BY detected_at DESC LIMIT 5000
     """, (end, start))
 
-    watched = feeds.watched_regions()
+    # Include regions found through account keys, as the Providers cards do.
+    watched = feeds.watched_regions(_provider_resources())
     provider_names = list(dict.fromkeys(
         [*feeds.PROVIDER_NAMES, *watched, *(r["provider"] for r in rows)]))
     region_names = sorted({r.strip() for regions in watched.values() for r in regions}

@@ -60,10 +60,15 @@ class Provider:
     key: str               # its regions setting
     about: str
     suggestions: tuple = ()
+    discovers: bool = False  # has an optional read-only account API key
 
     @property
     def enabled_key(self) -> str:
         return self.key.replace("_REGIONS", "_ENABLED")
+
+    @property
+    def api_key_key(self) -> str:
+        return self.key.replace("_REGIONS", "_API_KEY")
 
 
 @dataclass(frozen=True)
@@ -88,16 +93,26 @@ PROVIDERS = (
     Provider("OVH", "OVHcloud", "OVH_REGIONS", "Public Cloud status RSS, by datacentre code",
              ("GRA", "SBG", "RBX", "BHS", "WAW", "UK1", "DE1")),
     Provider("DigitalOcean", "DigitalOcean", "DIGITALOCEAN_REGIONS", "status.digitalocean.com, by datacentre",
-             ("LON1", "AMS3", "FRA1", "NYC1", "NYC3", "SFO3", "SGP1", "TOR1", "Global")),
+             ("LON1", "AMS3", "FRA1", "NYC1", "NYC3", "SFO3", "SGP1", "TOR1", "Global"),
+             discovers=True),
     Provider("Linode", "Linode", "LINODE_REGIONS", "status.linode.com, by component name",
-             ("GB-LON", "Linode.com")),
+             ("GB-LON", "Linode.com"), discovers=True),
     Provider("Cloudflare", "Cloudflare", "CLOUDFLARE_REGIONS", "cloudflarestatus.com, by airport code",
              ("LHR", "MAN", "AMS", "FRA", "CDG", "IAD")),
     Provider("Scaleway", "Scaleway", "SCALEWAY_REGIONS", "status.scaleway.com, by region",
              ("fr-par", "nl-ams", "pl-waw")),
     Provider("Hetzner", "Hetzner", "HETZNER_REGIONS", "status.hetzner.com Atom feed, by location",
-             ("FSN1", "NBG1", "HEL1", "ASH", "HIL", "SIN", "Network")),
+             ("FSN1", "NBG1", "HEL1", "ASH", "HIL", "SIN", "Network"), discovers=True),
 )
+
+DISCOVERY_HELP = {
+    "DIGITALOCEAN_API_KEY": "An account token with droplets:read_only, to watch the regions your Droplets are in.",
+    "LINODE_API_KEY": "A personal access token with linodes:read_only, to watch the regions your Linodes are in.",
+    "HETZNER_API_KEY": "A project token, to watch the locations your servers are in.",
+}
+PROVIDER_API_KEY_FIELDS = tuple(
+    Field(p.api_key_key, f"{p.label} API key", "secret",
+          help=DISCOVERY_HELP[p.api_key_key]) for p in PROVIDERS if p.discovers)
 
 GENERAL = (
     Field("FILTER_KEYWORDS", "Keywords", "list"),
@@ -171,6 +186,21 @@ CHANNELS = (
         Field("FRESHDESK_EXTRA_FIELDS", "Extra fields (JSON)", "json", wide=True,
               help='Added to every new ticket, such as {"type": "Incident"}.'),
     )),
+    Channel("freshservice", "Freshservice", "tickets", (
+        Field("FRESHSERVICE_DOMAIN", "Helpdesk", help="The part before .freshservice.com, or the full URL."),
+        Field("FRESHSERVICE_API_KEY", "API key", "secret", help="An agent's key, from their profile settings."),
+        Field("FRESHSERVICE_REQUESTER_EMAIL", "Requester email",
+              help="Who tickets come from, such as skyfarer@yourcompany.com. Freshservice adds them as a contact."),
+        Field("FRESHSERVICE_PRIORITY", "Priority", "select", default="2",
+              options=(("1", "Low"), ("2", "Medium"), ("3", "High"), ("4", "Urgent"))),
+        Field("FRESHSERVICE_GROUP_ID", "Group ID", help="Optional. A number from Admin > Groups."),
+        Field("FRESHSERVICE_TAGS", "Tags", "list", default="skyfarer,auto-raised"),
+        Field("FRESHSERVICE_RESOLVE", "Change the status when the incident ends", "bool", default="true"),
+        Field("FRESHSERVICE_RESOLVED_STATUS", "Status when it ends", "select", default="4",
+              options=(("4", "Resolved"), ("5", "Closed"))),
+        Field("FRESHSERVICE_EXTRA_FIELDS", "Extra fields (JSON)", "json", wide=True,
+              help='Added to every new ticket, such as {"custom_fields": {"cf_service": "Cloud"}}.'),
+    )),
     Channel("pushover", "Pushover", "alerts", (
         Field("PUSHOVER_TOKEN", "Application token", "secret"),
         Field("PUSHOVER_USER", "User or group key", "secret"),
@@ -197,10 +227,12 @@ CHANNELS = (
 )
 
 CHANNEL_BY_ID = {c.id: c for c in CHANNELS}
-FIELDS = {f.key: f for f in GENERAL + RULES + tuple(f for c in CHANNELS for f in c.fields)}
+FIELDS = {f.key: f for f in (GENERAL + RULES + PROVIDER_API_KEY_FIELDS
+                             + tuple(f for c in CHANNELS for f in c.fields))}
 
 # Every key apply() manages in the environment.
 MANAGED = (tuple(p.key for p in PROVIDERS) + tuple(p.enabled_key for p in PROVIDERS)
+           + tuple(p.api_key_key for p in PROVIDERS if p.discovers)
            + tuple(FIELDS) + tuple(c.enabled_key for c in CHANNELS))
 
 # The single webhook .env can describe, imported as the first webhook.
@@ -215,6 +247,8 @@ def label(key: str) -> str:
             return f"{p.label} regions"
         if key == p.enabled_key:
             return p.label
+        if p.discovers and key == p.api_key_key:
+            return f"{p.label} API key"
     for c in CHANNELS:
         if key == c.enabled_key:
             return c.name
@@ -484,6 +518,7 @@ def _to_env(values: dict[str, str]) -> None:
     for p in PROVIDERS:
         if values.get(p.enabled_key, "true") == "false":
             env.pop(p.key, None)
+            env.pop(p.api_key_key, None)
     for c in CHANNELS:
         if values.get(c.enabled_key, "true") == "false":
             for f in c.fields:
@@ -568,15 +603,18 @@ def bootstrap() -> None:
 def import_summary(found: dict[str, str], webhook: bool) -> str:
     providers = [p for p in PROVIDERS if found.get(p.key)]
     regions = sum(len(split_list(found[p.key])) for p in providers)
+    keys = sum(1 for p in PROVIDERS if p.discovers and found.get(p.api_key_key))
     channels = [c.name for c in CHANNELS if any(found.get(f.key) for f in c.fields
                                                  if f.kind == "secret" or f.key.endswith(
                                                      ("_SUBDOMAIN", "_INSTANCE", "_SITE", "_DOMAIN", "_TARGETS")))]
     if webhook:
         channels.append("a webhook")
-    if not providers and not channels:
+    if not providers and not channels and not keys:
         return "nothing set"
     parts = [f"{len(providers)} provider{'s' if len(providers) != 1 else ''} with "
              f"{regions} region{'s' if regions != 1 else ''}"]
+    if keys:
+        parts.append(f"{keys} provider API key{'s' if keys != 1 else ''}")
     if channels:
         parts.append(f"{len(channels)} channel{'s' if len(channels) != 1 else ''}: "
                      + ", ".join(channels))

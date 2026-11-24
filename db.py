@@ -13,12 +13,14 @@ poll_log          – one row per poll cycle for observability
 settings, webhooks, users, settings_log – see settings.py
 api_tokens         – hashed bearer tokens for the JSON API
 api_rate_limits    – short-lived request counters shared by every worker
+dashboard_state, login_failures – shared first-run code and sign-in throttle
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -66,6 +68,12 @@ ALTER TABLE incidents ADD COLUMN IF NOT EXISTS update_count INTEGER NOT NULL DEF
 -- Planned work rather than a fault (scheduled maintenance).
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS is_maintenance BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Account resources an incident touches, from an optional provider API key.
+-- resource_counts is {region: count}; NULL means no key/snapshot for that
+-- provider, while an empty object means the key was read and found none there.
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resource_counts JSONB;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resources_affected INTEGER;
+
 CREATE INDEX IF NOT EXISTS idx_incidents_state ON incidents (state);
 CREATE INDEX IF NOT EXISTS idx_incidents_provider ON incidents (provider);
 
@@ -86,7 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_incident_updates_incident ON incident_updates (in
 CREATE TABLE IF NOT EXISTS notifications (
     id              SERIAL PRIMARY KEY,
     incident_id     INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
-    channel         TEXT NOT NULL,             -- zendesk | servicenow | pushover | pagerduty | teams | snmp | webhook
+    channel         TEXT NOT NULL,             -- any notifiers.SENDERS key, or webhook-<id>
     event           TEXT NOT NULL,             -- opened | updated | resolved
     payload         JSONB NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | failed
@@ -108,6 +116,16 @@ CREATE TABLE IF NOT EXISTS poll_log (
     tickets_resolved INTEGER NOT NULL DEFAULT 0,
     open_count      INTEGER NOT NULL DEFAULT 0,
     error           TEXT
+);
+
+-- Last good read of each provider's account API: how many resources the
+-- account has in each region. Only providers with an API key have rows here.
+CREATE TABLE IF NOT EXISTS provider_resources (
+    provider       TEXT NOT NULL,
+    region         TEXT NOT NULL,
+    count          INTEGER NOT NULL,
+    discovered_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (provider, region)
 );
 
 -- Records in ticketing systems other than Zendesk (whose ticket number is
@@ -183,6 +201,23 @@ CREATE TABLE IF NOT EXISTS api_rate_limits (
 CREATE INDEX IF NOT EXISTS idx_api_rate_limits_bucket ON api_rate_limits (bucket, at);
 CREATE INDEX IF NOT EXISTS idx_api_rate_limits_at ON api_rate_limits (at);
 
+-- First-run setup code and sign-in throttling live here, not in a worker's
+-- memory, so gunicorn can run several workers (or replicas).
+CREATE TABLE IF NOT EXISTS dashboard_state (
+    key             TEXT PRIMARY KEY,
+    value           TEXT NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS login_failures (
+    id              BIGSERIAL PRIMARY KEY,
+    bucket          TEXT NOT NULL,             -- client address + email
+    failed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_failures_bucket ON login_failures (bucket, failed_at);
+CREATE INDEX IF NOT EXISTS idx_login_failures_time ON login_failures (failed_at);
+
 -- Who changed what. Secret values are never written here.
 CREATE TABLE IF NOT EXISTS settings_log (
     id              SERIAL PRIMARY KEY,
@@ -209,9 +244,12 @@ def get_conn():
 
 def init_schema():
     """Create tables and indexes if they don't exist, and apply the small
-    column additions that older databases need."""
+    column additions that older databases need. Every dashboard worker and the
+    poller run this at start; the lock stops their CREATE TABLE IF NOT EXISTS
+    statements racing, which Postgres can refuse with a unique violation."""
     with get_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(77700)")
             cur.execute(SCHEMA_SQL)
             # Added for the API's service accounts; safe to run repeatedly.
             cur.execute("""ALTER TABLE users ADD COLUMN IF NOT EXISTS kind
@@ -274,7 +312,9 @@ def insert_incident(conn, *, guid: str, provider: str, region: str,
                     state: str, ticket_id: int | None,
                     detected_at: datetime | None = None,
                     resolved_at: datetime | None = None,
-                    is_maintenance: bool = False) -> int | None:
+                    is_maintenance: bool = False,
+                    resource_counts: dict | None = None,
+                    resources_affected: int | None = None) -> int | None:
     """Insert a new incident row and return its ID (None if it already exists).
 
     detected_at / resolved_at reflect the real incident timeline (the feed's
@@ -291,15 +331,56 @@ def insert_incident(conn, *, guid: str, provider: str, region: str,
             INSERT INTO incidents
                 (guid, provider, region, title, summary, link,
                  feed_published, feed_updated, state, ticket_id,
-                 detected_at, resolved_at, ingested_at, is_maintenance)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 detected_at, resolved_at, ingested_at, is_maintenance,
+                 resource_counts, resources_affected)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (guid) DO NOTHING
             RETURNING id
         """, (guid, provider, region, title, summary, link,
               feed_published, feed_updated, state, ticket_id,
-              detected_at, resolved_at, now, is_maintenance))
+              detected_at, resolved_at, now, is_maintenance,
+              Json(resource_counts) if resource_counts is not None else None,
+              resources_affected))
         row = cur.fetchone()
         return row[0] if row else None
+
+
+def update_resource_impact(conn, incident_id: int, counts: dict,
+                           affected: int) -> None:
+    """Keep an incident's resource count in step with the last account read."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE incidents
+               SET resource_counts = %s, resources_affected = %s, updated_at = %s
+             WHERE id = %s
+        """, (Json(counts), affected, datetime.now(timezone.utc), incident_id))
+
+
+def replace_provider_resources(conn, discovered: dict[str, dict[str, int]],
+                               cleared=(), failed=()) -> None:
+    """Store a good account read. A provider whose read failed keeps its old
+    rows, so a brief API outage doesn't make its regions disappear."""
+    failed = set(failed)
+    with conn.cursor() as cur:
+        for provider in set(discovered) | set(cleared):
+            if provider in failed:
+                continue
+            cur.execute("DELETE FROM provider_resources WHERE provider = %s", (provider,))
+            for region, count in sorted((discovered.get(provider) or {}).items()):
+                cur.execute("""
+                    INSERT INTO provider_resources (provider, region, count)
+                    VALUES (%s, %s, %s)
+                """, (provider, region, count))
+
+
+def provider_resources(conn) -> dict[str, dict[str, int]]:
+    """Last good account read as {provider: {region: count}}."""
+    out: dict[str, dict[str, int]] = {}
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT provider, region, count FROM provider_resources")
+        for row in cur.fetchall():
+            out.setdefault(row["provider"], {})[row["region"]] = row["count"]
+    return out
 
 
 def mark_resolved(conn, guid: str, resolved_at: datetime | None = None) -> None:
@@ -441,3 +522,69 @@ def log_poll(conn, *, entries_seen: int, tickets_created: int,
             VALUES (%s, %s, %s, %s, %s, %s)
         """, (entries_seen, tickets_created, tickets_resolved, open_count,
               error, feed_errors))
+
+
+# ─── Dashboard state shared by every worker ─────────────────────────────────
+
+SETUP_CODE_KEY = "setup_code"
+
+
+def lock_setup(conn) -> None:
+    """Hold off other workers while the first admin is being created."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(77702)")
+
+
+def setup_code(conn) -> str:
+    """Return the one-time setup code, creating it once if it doesn't exist.
+
+    The caller logs it. Workers that start later can read the same value, so a
+    restart doesn't strand the setup page with a code nobody can find.
+    """
+    lock_setup(conn)
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM dashboard_state WHERE key = %s", (SETUP_CODE_KEY,))
+        existing = cur.fetchone()
+        if existing:
+            return existing[0]
+        code = "-".join(secrets.token_hex(3) for _ in range(3))
+        cur.execute("""
+            INSERT INTO dashboard_state (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO NOTHING RETURNING value
+        """, (SETUP_CODE_KEY, code))
+        inserted = cur.fetchone()
+        if inserted:
+            return inserted[0]
+        cur.execute("SELECT value FROM dashboard_state WHERE key = %s", (SETUP_CODE_KEY,))
+        return cur.fetchone()[0]
+
+
+def clear_setup_code(conn) -> None:
+    """The code is single-use: drop it once the first admin exists."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM dashboard_state WHERE key = %s", (SETUP_CODE_KEY,))
+
+
+def lock_login(conn, bucket: str) -> None:
+    """Serialise counting and recording failures for one sign-in attempt."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(77703, hashtext(%s))", (bucket,))
+
+
+def login_failures(conn, bucket: str, window: int) -> int:
+    """Wrong attempts for this address/email inside the last `window` seconds."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM login_failures WHERE failed_at < NOW() - %s * INTERVAL '1 second'",
+                    (window,))
+        cur.execute("SELECT COUNT(*) FROM login_failures WHERE bucket = %s", (bucket,))
+        return cur.fetchone()[0]
+
+
+def login_failed(conn, bucket: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO login_failures (bucket) VALUES (%s)", (bucket,))
+
+
+def login_succeeded(conn, bucket: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM login_failures WHERE bucket = %s", (bucket,))

@@ -93,6 +93,7 @@
           <strong>{{ p.label }}</strong>
           <span class="status tone-{{ p.tone }} dot">{{ p.status }}</span>
           <span class="regions" title="{{ p.regions }}">{{ p.regions }}</span>
+          {% if p.discovered %}<span class="sub" style="font-size: 12px">Your resources: {{ p.discovered }}</span>{% endif %}
         </a>
       {% endfor %}
     </div>
@@ -166,10 +167,10 @@
       </div>
       {% if incidents %}
       <div class="scroll">
-        <table style="min-width: 780px">
+        <table style="min-width: 880px">
           <thead><tr>
             <th>State</th><th>Provider · region</th><th>Incident</th>
-            <th style="text-align: right">Updates</th><th>Ticket</th><th>Started</th><th>Duration</th>
+            <th style="text-align: right">Updates</th><th style="text-align: right">Your resources</th><th>Ticket</th><th>Started</th><th>Duration</th>
           </tr></thead>
           <tbody>
           {% for row in incidents %}
@@ -181,6 +182,7 @@
                 {% if row.summary %}<div class="incident-summary" title="{{ row.summary }}">{{ row.summary }}</div>{% endif %}
               </td>
               <td class="num sub" style="text-align: right">{{ row.update_count or "—" }}</td>
+              <td class="num sub" style="text-align: right" title="{{ row.resource_breakdown }}">{{ row.resources_affected if row.resources_affected is not none else "—" }}</td>
               <td class="nowrap mono" style="font-size: 13px">
                 {% for t in row.tickets %}
                   <div>{% if t.url %}<a href="{{ t.url }}" target="_blank" rel="noopener">{{ t.label }}</a>{% else %}{{ t.label }}{% endif %}</div>
