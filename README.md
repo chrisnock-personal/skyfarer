@@ -142,9 +142,11 @@ can never write anything even if given a write scope; admin endpoints check the
 role again on every request. For automation, create a *service account* (no
 password, no sign-in) to own the token. Revoke a token from the same page; its
 `last_used_at` is recorded. Requests are throttled per token and per client IP
-(120 and 300 per minute by default), with `429` and `Retry-After` when exceeded;
-`SKYFARER_API_RATE_LIMIT` and `SKYFARER_API_IP_RATE_LIMIT` change the limits.
-Counters are in Postgres, so several dashboard workers share them.
+(120 and 300 per minute by default), with `429` and `Retry-After` when exceeded.
+Counters are in Postgres, so several dashboard workers share them. The two limits
+are startup settings, not dashboard settings: set `SKYFARER_API_RATE_LIMIT` and
+`SKYFARER_API_IP_RATE_LIMIT` in the environment before starting the dashboard and
+restart it after changing them.
 
 ```sh
 export SKYFARER_URL=http://127.0.0.1:8080
@@ -188,10 +190,10 @@ against a running, uninitialised instance using `SKYFARER_BOOTSTRAP_SECRET` as
 
 ## Settings and accounts
 
-Only three things stay in `.env`: `SKYFARER_SECRET_KEY`, the Postgres
-connection and the dashboard's address (plus the feed URLs, which only change
-for testing). Everything else is kept in the database and changed in the
-dashboard:
+Most settings are kept in the database and changed in the dashboard. A handful
+stay in `.env`: `SKYFARER_SECRET_KEY`, the Postgres connection, the dashboard's
+address, the feed URLs (which only change for testing) and the API rate limits
+(which need a dashboard restart to apply). Everything else is managed here:
 
 - **Providers and regions.** Each provider can be switched on or off without
   losing its regions. Regions are added as tags, with suggestions of common
@@ -754,10 +756,12 @@ network.
 
 ## .env reference
 
-See `.env.example` for the full list with comments. Apart from
-`SKYFARER_SECRET_KEY`, Postgres, the dashboard's address and the feed URLs,
-those settings are read once, on the first start, and imported into the
-database; after that, change them in the dashboard.
+See `.env.example` for the full list with comments. Most settings are read once,
+on the first start, and imported into the database; after that, change them in
+the dashboard. The exceptions stay in the environment: `SKYFARER_SECRET_KEY`,
+the Postgres connection, the dashboard's address, the feed URLs (testing only)
+and the two `SKYFARER_API_*_RATE_LIMIT` values. The rate limits are read when the
+dashboard starts, so restart it after editing them.
 
 ## License
 
