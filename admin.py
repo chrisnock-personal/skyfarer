@@ -249,13 +249,19 @@ def settings_home():
 @bp.route("/settings/providers", methods=["GET", "POST"])
 def providers():
     with db.get_conn() as conn:
-        values = settings.load(conn)
+        unreadable: set = set()
+        values = settings.load(conn, unreadable)
         if request.method == "POST":
             form = request.form
             proposed = {}
             for p in settings.PROVIDERS:
                 proposed[p.enabled_key] = "true" if form.get(p.enabled_key) else "false"
                 proposed[p.key] = settings.join_list(settings.split_list(form.get(p.key, "")))
+                if p.discovers:
+                    if form.get(f"remove_{p.api_key_key}"):
+                        proposed[p.api_key_key] = None
+                    elif form.get(p.api_key_key, "").strip():
+                        proposed[p.api_key_key] = form[p.api_key_key].strip()
             proposed["FILTER_KEYWORDS"] = settings.join_list(
                 settings.split_list(form.get("FILTER_KEYWORDS", "")))
             interval = form.get("POLL_INTERVAL_SECONDS", "")
@@ -269,6 +275,8 @@ def providers():
         with conn.cursor() as cur:
             cur.execute("SELECT polled_at, feed_errors FROM poll_log ORDER BY polled_at DESC LIMIT 1")
             last = cur.fetchone()
+        discovered = db.provider_resources(conn)
+        secrets = settings.secret_meta(conn)
     feed_errors = {}
     for part in ((last[1] if last else "") or "").split("; "):
         name, _, reason = part.partition(": ")
@@ -277,10 +285,14 @@ def providers():
     cards = []
     for p in settings.PROVIDERS:
         regions = settings.split_list(values.get(p.key, ""))
+        found = discovered.get(p.name, {})
         on = effective(values, p.enabled_key) == "true"
+        api_error = feed_errors.get(f"{p.name} API", "")
         if not on:
             health, tone = "Off", "muted"
-        elif not regions:
+        elif api_error:
+            health, tone = "Account API error", "bad"
+        elif not regions and not found:
             health, tone = "No regions", "warn"
         elif p.name in feed_errors:
             health, tone = "Feed error", "bad"
@@ -289,7 +301,8 @@ def providers():
         else:
             health, tone = "Not read yet", "muted"
         cards.append({"p": p, "on": on, "regions": regions, "health": health, "tone": tone,
-                      "error": feed_errors.get(p.name, ""),
+                      "error": feed_errors.get(p.name, "") or api_error,
+                      "discovered": ", ".join(f"{r} ({n})" for r, n in sorted(found.items())),
                       "suggestions": [s for s in p.suggestions if s not in regions]})
     current_interval = effective(values, "POLL_INTERVAL_SECONDS")
     options = list(settings.FIELDS["POLL_INTERVAL_SECONDS"].options)
@@ -298,6 +311,8 @@ def providers():
     return render_template("settings_providers.html", cards=cards,
                            keywords=settings.split_list(values.get("FILTER_KEYWORDS", "")),
                            interval=current_interval, interval_options=options,
+                           secrets=secrets, unreadable=unreadable,
+                           api_help={f.key: f.help for f in settings.PROVIDER_API_KEY_FIELDS},
                            last_poll=last[0] if last else None)
 
 

@@ -46,9 +46,12 @@ def _env_list(name: str) -> list[str]:
 def configure() -> None:
     """Read the settings from the environment. settings.apply() puts the
     database's values there and calls this before every poll, so a change made
-    in the dashboard applies from the next one."""
+    in the dashboard applies from the next one. Regions discovered from an
+    account API are added again by the poller after this runs."""
     global AWS_REGIONS, OVH_REGIONS, AZURE_REGIONS, GCP_REGIONS, HETZNER_REGIONS
     global FILTER_KEYWORDS, OVH_FEED_URL, AZURE_FEED_URL, GCP_INCIDENTS_URL, HETZNER_FEED_URL
+    global DISCOVERED_REGIONS
+    DISCOVERED_REGIONS = {}
     AWS_REGIONS = _env_list("AWS_REGIONS")
     OVH_REGIONS = _env_list("OVH_REGIONS")
     AZURE_REGIONS = _env_list("AZURE_REGIONS")
@@ -61,6 +64,37 @@ def configure() -> None:
     AZURE_FEED_URL = os.getenv("AZURE_FEED_URL", "https://rssfeed.azure.status.microsoft/en-us/status/feed/")
     GCP_INCIDENTS_URL = os.getenv("GCP_INCIDENTS_URL", "https://status.cloud.google.com/incidents.json")
     HETZNER_FEED_URL = os.getenv("HETZNER_FEED_URL", "https://status.hetzner.com/en.atom")
+
+
+# Regions found from a provider's account API, keyed by provider. They are
+# merged with the configured ones for this process only: the poller refreshes
+# them each cycle, and a dashboard process reads the last good snapshot from
+# Postgres instead of making its own API calls.
+DISCOVERED_REGIONS: dict[str, list[str]] = {}
+
+
+def _union_regions(*groups) -> list[str]:
+    """Combine region lists without repeating a code in a different case."""
+    out: list[str] = []
+    for group in groups:
+        for region in group or []:
+            region = region.strip()
+            if region and region not in out:
+                out.append(region)
+    return [r for i, r in enumerate(out)
+            if r.lower() not in {x.lower() for x in out[:i]}]
+
+
+def apply_discovered(discovered: dict[str, dict]) -> None:
+    """Watch the regions found in a user's account as well as the configured
+    ones. Keys are provider names; values are region -> resource count. Rebuild
+    from the environment each time, so a removed key can't leave regions behind
+    until the next settings.apply()."""
+    global AWS_REGIONS, HETZNER_REGIONS, DISCOVERED_REGIONS
+    DISCOVERED_REGIONS = {name: list(regions) for name, regions in discovered.items()}
+    AWS_REGIONS = _union_regions(_env_list("AWS_REGIONS"), DISCOVERED_REGIONS.get("AWS", []))
+    HETZNER_REGIONS = _union_regions(_env_list("HETZNER_REGIONS"),
+                                    DISCOVERED_REGIONS.get("Hetzner", []))
 
 
 configure()
@@ -84,7 +118,8 @@ class StatuspageProvider:
 
     @property
     def regions(self) -> list[str]:
-        return _env_list(f"{self.env}_REGIONS")
+        return _union_regions(_env_list(f"{self.env}_REGIONS"),
+                              DISCOVERED_REGIONS.get(self.name, []))
 
     @property
     def base_url(self) -> str:
@@ -99,9 +134,10 @@ STATUSPAGE_PROVIDERS = (
 )
 
 
-def watched_regions() -> dict[str, list[str]]:
+def watched_regions(discovered: Optional[dict[str, dict]] = None) -> dict[str, list[str]]:
     """Every provider and the regions watched on it, in display order. A
-    provider with no regions is switched off."""
+    provider with no regions is switched off. `discovered` lets a process that
+    doesn't poll show the last account snapshot kept in Postgres."""
     regions = {
         "AWS": AWS_REGIONS, "Azure": AZURE_REGIONS, "GCP": GCP_REGIONS,
         "OVH": OVH_REGIONS,
@@ -109,6 +145,10 @@ def watched_regions() -> dict[str, list[str]]:
     for p in STATUSPAGE_PROVIDERS:
         regions[p.name] = p.regions
     regions["Hetzner"] = HETZNER_REGIONS
+    extra = DISCOVERED_REGIONS if discovered is None else discovered
+    for name, counts in extra.items():
+        if name in regions:
+            regions[name] = _union_regions(regions[name], counts)
     return regions
 
 

@@ -224,6 +224,17 @@ def _subject(row: dict) -> str:
     return f"[{n['provider']}] {n['region']} – {n['title']}"
 
 
+def _impact_line(payload: dict) -> str:
+    """A line about the account resources in the affected regions, when a
+    provider API key was read. Zero is worth saying; no read is not."""
+    impact = payload.get("resource_impact")
+    if impact is None:
+        return ""
+    regions = ", ".join(f"{name}: {count}" for name, count in
+                        (impact.get("regions") or {}).items()) or "none in these regions"
+    return f"Account resources in affected regions: {impact.get('total', 0)} ({regions})\n"
+
+
 # ─── Zendesk ────────────────────────────────────────────────────────────────
 
 def _zd_auth() -> tuple[str, str]:
@@ -239,6 +250,7 @@ def zendesk_ticket(row: dict) -> dict:
     body = (
         f"**Provider:** {n['provider']}\n"
         f"**Region:** {n['region']}\n"
+        f"{_impact_line(n)}"
         f"**Link:** {n['link']}\n\n"
         f"--- Timeline ---\n\n"
         f"**Incident published:** {n['published']}\n"
@@ -339,6 +351,7 @@ def servicenow_record(row: dict) -> dict:
     description = (
         f"Provider: {n['provider']}\n"
         f"Region: {n['region']}\n"
+        f"{_impact_line(n)}"
         f"Status page: {n['link']}\n\n"
         f"Incident published: {n['published']}\n"
         f"Last updated: {n['updated']}\n"
@@ -491,6 +504,7 @@ def jsm_request(row: dict) -> dict:
     description = (
         f"Provider: {n['provider']}\n"
         f"Region: {n['region']}\n"
+        f"{_impact_line(n)}"
         f"Status page: {n['link']}\n\n"
         f"Incident published: {n['published']}\n"
         f"Last updated: {n['updated']}\n"
@@ -600,6 +614,7 @@ def freshdesk_ticket(row: dict) -> dict:
     description = (
         f"Provider: {n['provider']}\n"
         f"Region: {n['region']}\n"
+        f"{_impact_line(n)}"
         f"Status page: {n['link']}\n\n"
         f"Incident published: {n['published']}\n"
         f"Last updated: {n['updated']}\n"
@@ -666,7 +681,7 @@ def pushover_message(row: dict) -> dict:
         "token": PUSHOVER_TOKEN,
         "user": PUSHOVER_USER,
         "title": f"{row['event'].capitalize()}: [{n['provider']}] {n['region']}"[:250],
-        "message": f"{n['title']}\n\n{n['summary']}"[:1024],
+        "message": f"{n['title']}\n{_impact_line(n)}\n{n['summary']}"[:1024],
         "url": n["link"][:512],
         "url_title": "Status page",
         "priority": 0,
@@ -708,7 +723,8 @@ def pagerduty_event(row: dict) -> dict:
             "component": n["region"],
             "group": n["provider"],
             "class": "provider-incident",
-            "custom_details": {"published": n["published"], "detail": n["summary"]},
+            "custom_details": {"published": n["published"], "detail": n["summary"],
+                               "resources_affected": n.get("resources_affected", "")},
         },
     }
 
@@ -742,7 +758,8 @@ def teams_card(row: dict) -> dict:
                         {"title": "Provider", "value": n["provider"]},
                         {"title": "Region", "value": n["region"]},
                         {"title": "Published", "value": n["published"]},
-                    ]},
+                    ] + ([{"title": "Your resources", "value": str(n["resources_affected"])}]
+                         if "resources_affected" in n else [])},
                     {"type": "TextBlock", "text": n["summary"][:1500], "wrap": True},
                 ],
                 "actions": [{"type": "Action.OpenUrl", "title": "Status page",
@@ -759,7 +776,8 @@ def send_teams(row: dict) -> None:
 # ─── Webhook ────────────────────────────────────────────────────────────────
 
 WEBHOOK_FIELDS = ("event", "incident_id", "provider", "region", "title", "summary",
-                  "link", "published", "updated", "noticed", "update_count")
+                  "link", "published", "updated", "noticed", "update_count",
+                  "resources_affected", "resource_impact")
 _PLACEHOLDER = re.compile(r"\{\{\s*([a-z_]+)\s*\}\}")
 
 
@@ -792,7 +810,7 @@ def webhook_body(row: dict, hook: Webhook) -> str:
     is_json = "json" in hook.content_type
 
     def fill(match: re.Match) -> str:
-        value = values[match.group(1)]
+        value = values.get(match.group(1), "")
         if isinstance(value, int) or not is_json:
             return str(value)
         return json.dumps(str(value))[1:-1]
@@ -866,6 +884,7 @@ def snmp_varbinds(row: dict) -> list[tuple[str, object]]:
         (f"{SNMP_BASE_OID}.1.3", n["title"][:255]),
         (f"{SNMP_BASE_OID}.1.4", n["link"][:255]),
         (f"{SNMP_BASE_OID}.1.5", row["incident_id"]),
+        (f"{SNMP_BASE_OID}.1.6", n.get("resources_affected", -1)),
     ]
 
 
