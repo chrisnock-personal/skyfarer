@@ -24,6 +24,7 @@ from flask import (Blueprint, abort, current_app, flash, g, redirect, render_tem
                    request, session, url_for)
 
 import db
+import history
 import notifiers
 import settings
 
@@ -299,6 +300,51 @@ def providers():
                            keywords=settings.split_list(values.get("FILTER_KEYWORDS", "")),
                            interval=current_interval, interval_options=options,
                            last_poll=last[0] if last else None)
+
+
+# ─── Settings: SLA targets ──────────────────────────────────────────────────
+
+@bp.route("/settings/sla", methods=["GET", "POST"])
+def sla():
+    errors: list[str] = []
+    submitted = request.form if request.method == "POST" else None
+    with db.get_conn() as conn:
+        values = settings.load(conn)
+        if request.method == "POST":
+            proposed = {}
+            for p in settings.PROVIDERS:
+                key = history.target_key(p.name)
+                raw = request.form.get(key, "").strip()
+                if not raw:
+                    if key in values:
+                        proposed[key] = None
+                    continue
+                try:
+                    value = float(raw)
+                except ValueError:
+                    errors.append(f"{p.label}: enter a percentage, such as 99.90.")
+                    continue
+                if not 0 <= value <= 100:
+                    errors.append(f"{p.label}: the target must be between 0 and 100%.")
+                    continue
+                if abs(value - history.target_value(values, p.name)) >= 1e-9:
+                    proposed[key] = f"{value:.2f}"
+            if errors:
+                conn.rollback()
+            else:
+                _saved_message(conn, settings.save(conn, proposed, _actor()))
+                return redirect(url_for("admin.sla"))
+
+    cards = []
+    for p in settings.PROVIDERS:
+        key = history.target_key(p.name)
+        cards.append({"p": p, "key": key,
+                      "value": (submitted.get(key, "") if submitted is not None
+                                else values.get(key, "")),
+                      "effective": history.target_value(values, p.name),
+                      "custom": key in values})
+    return render_template("settings_sla.html", cards=cards, errors=errors,
+                           default=history.DEFAULT_TARGET)
 
 
 # ─── Settings: channels and webhooks ────────────────────────────────────────

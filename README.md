@@ -88,10 +88,32 @@ light, and the browser remembers the choice. It shows:
 - Time-range filtering (Today / 7d / 30d / 90d / All time, or a custom
   from–to date range), applied to the incidents, notifications and poll_log
   tables
+- A **History & SLA** page (`/history`), linked in the header
 
 The page auto-refreshes every 30 seconds. Admins also see **Settings**.
 
 ![Delivery channel health, and the poll cycle chart with failed feed reads marked](docs/images/health.png)
+
+## History and SLA
+
+`History` in the header opens a report over 30 days, a quarter (90 days), a
+year, or a custom from–to range, with optional provider and region filters and
+a CSV export of every incident in the selection. It shows vendor availability,
+total downtime, error budget used, the longest incident, a per-provider
+breakdown and a monthly downtime chart.
+
+Downtime is taken from each incident's own feed-reported start and end times,
+clamped to the selected window; open incidents count up to now and are marked
+*ongoing*. Overlapping incidents at one provider are counted once, so two
+regions failing together don't read as twice the outage. Planned maintenance is
+listed but excluded from downtime. Availability is the average across the
+providers in view, and the error budget is the window's minutes multiplied by
+`100 − target` for each of them; the strictest target in view applies to the
+combined budget.
+
+Admins set the target per provider under **Settings > SLA targets**. The
+default is 99.90% and stored targets are recorded in the settings change
+history like any other setting. Nothing here changes polling or alerting.
 
 ## Settings and accounts
 
@@ -111,6 +133,8 @@ dashboard:
   ticket and sets it to pending.
 - **Webhooks.** Any number, each with its own URL, method, events, template,
   headers and signing secret.
+- **SLA targets.** Per-provider availability percentages for History & SLA,
+  defaulting to 99.90%.
 - **Users and access.** Admins see and change everything; viewers see the
   dashboard and nothing under Settings. There's always at least one admin, and
   nobody can change their own role.
@@ -237,9 +261,10 @@ The delivery queue: one row per notice per channel. See
 
 ### `settings`, `webhooks`, `users`, `settings_log`
 
-The dashboard's settings (keyed by their `.env` names, secrets encrypted),
-the webhooks, the accounts (password hashes, and setup links as SHA-256 hashes)
-and the change history. See [Settings and accounts](#settings-and-accounts).
+The dashboard's settings (keyed by their `.env` names, secrets encrypted, plus
+`SLA_TARGET_*` for the History report), the webhooks, the accounts (password
+hashes, and setup links as SHA-256 hashes) and the change history. See
+[Settings and accounts](#settings-and-accounts).
 
 ### `poll_log`
 
@@ -587,9 +612,9 @@ Covers each channel's payload against its published limits, which failures
 retry, what gets queued for which channel, delivery order, and settings checks,
 plus region matching and parsing for the Statuspage and Hetzner feeds (from
 trimmed copies of real payloads), and how stored settings reach the poller,
-switches, secret encryption, the change history's wording, and updates on
-providers with a stable incident ID. They need no
-database or network.
+switches, secret encryption, the change history's wording, updates on
+providers with a stable incident ID, and the History report's numbers, CSV and
+page rendering. They need no database or network.
 
 ## .env reference
 

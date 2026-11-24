@@ -138,6 +138,12 @@ class History(unittest.TestCase):
         stored = [c.args[1] for c in conn.cursor().__enter__().execute.call_args_list]
         self.assertFalse(any("new-secret-value" in str(p) for p in stored))
 
+    def test_sla_target_is_named_in_change_history(self):
+        self.assertEqual(settings.label("SLA_TARGET_DIGITALOCEAN"),
+                         "DigitalOcean availability target")
+        self.assertEqual(settings.label("SLA_TARGET_UNKNOWN"),
+                         "UNKNOWN availability target")
+
     def test_import_summary(self):
         found = {"AWS_REGIONS": "eu-west-2", "HETZNER_REGIONS": "FSN1,NBG1",
                  "PAGERDUTY_ROUTING_KEY": "k", "ZENDESK_SUBDOMAIN": "acme"}

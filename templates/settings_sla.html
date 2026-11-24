@@ -1,0 +1,40 @@
+{% extends "settings_base.html" %}
+{% block title %}SLA targets · Skyfarer{% endblock %}
+{% block heading %}
+<div>
+  <h1>SLA targets</h1>
+  <p class="lede">Your own availability targets for each provider, used by History &amp; SLA to work out the error budget and whether a vendor is within target. They don't change what gets polled or alerted on.</p>
+</div>
+{% endblock %}
+{% block content %}
+{% for error in errors %}
+  <div class="flash bad" role="alert">{{ error }}</div>
+{% endfor %}
+<form method="post" action="{{ url_for('admin.sla') }}">
+  <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+  <section class="card pad" aria-labelledby="sla-h">
+    <div class="group-head">
+      <h2 id="sla-h">Availability targets</h2>
+      <p class="hint">Percentages, up to two decimal places. Leave blank to use {{ '%.2f'|format(default) }}%. Downtime is measured from each status-page incident's own start and end times; planned maintenance is excluded.</p>
+    </div>
+    <div class="form-grid">
+      {% for c in cards %}
+        <div class="field">
+          <label for="{{ c.key }}">{{ c.p.label }}</label>
+          <input class="input short" id="{{ c.key }}" name="{{ c.key }}" type="number"
+                 min="0" max="100" step="0.01" value="{{ c.value }}"
+                 placeholder="{{ '%.2f'|format(c.effective) }}">
+          <span class="hint">{{ c.p.about }}</span>
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+  <div class="savebar">
+    <span class="state">Changes show on the next History page load</span>
+    <div class="end">
+      <a class="btn" href="{{ url_for('admin.sla') }}">Discard</a>
+      <button type="submit" class="btn primary">Save targets</button>
+    </div>
+  </div>
+</form>
+{% endblock %}

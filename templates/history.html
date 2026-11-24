@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+{% block title %}History &amp; SLA · Skyfarer{% endblock %}
+{% block nav %}
+    <a href="/#providers">Providers</a>
+    <a href="/#incidents">Incidents</a>
+    <a href="/#deliveries">Deliveries</a>
+    <a href="/#polls">Poll log</a>
+    <a href="{{ url_for('history_page') }}" class="current" aria-current="page">History</a>
+{% endblock %}
+{% block body %}
+<main>
+  <div class="page-head">
+    <div>
+      <h1>History &amp; SLA</h1>
+      <p>Vendor downtime in the regions you watch, against your own targets.</p>
+    </div>
+    <div class="range">
+      <div class="seg" role="group" aria-label="Time range">
+        {% for key, label in range_labels %}
+          <a class="{{ 'on' if range_key == key else '' }}" href="{{ link(range=key, date_from='', date_to='') }}">{{ label }}</a>
+        {% endfor %}
+      </div>
+      <form class="custom" id="history-filter" method="get" action="{{ url_for('history_page') }}">
+        <input type="hidden" name="range" value="{{ range_key }}">
+        <label for="h-provider" class="sr-only">Provider</label>
+        <select id="h-provider" name="provider">
+          <option value="all">All providers</option>
+          {% for value, label in provider_options %}
+            <option value="{{ value }}" {{ 'selected' if provider == value }}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <label for="h-region" class="sr-only">Region</label>
+        <select id="h-region" name="region">
+          <option value="all">All regions</option>
+          {% for value in region_options %}
+            <option value="{{ value }}" {{ 'selected' if region == value }}>{{ value }}</option>
+          {% endfor %}
+        </select>
+        <label for="h-from" class="sr-only">From</label>
+        <input id="h-from" type="date" name="from" value="{{ from_date }}" data-history-date>
+        <span aria-hidden="true">–</span>
+        <label for="h-to" class="sr-only">To</label>
+        <input id="h-to" type="date" name="to" value="{{ to_date }}" data-history-date>
+        <button type="submit">Apply</button>
+      </form>
+      <a class="btn small" href="{{ link(format='csv') }}">Export CSV</a>
+    </div>
+  </div>
+
+  <section class="kpis" aria-label="Summary">
+    <div class="card kpi">
+      <div class="label">Vendor availability</div>
+      <div class="row"><span class="value tone-{{ 'good' if report.availability >= report.target else 'bad' }}">{{ report.availability_label }}</span>
+        <span class="note">target {{ report.target_label }}</span></div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Downtime</div>
+      <div class="row"><span class="value">{{ report.downtime_label }}</span>
+        <span class="note">{{ report.incident_count }} incident{{ '' if report.incident_count == 1 else 's' }} · {{ report.maintenance_count }} in maintenance</span></div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Error budget used</div>
+      <div class="row"><span class="value tone-{{ 'bad' if report.used > 100 else 'warn' if report.used > 75 else 'good' }}">{{ report.used_label }}</span>
+        <span class="note">of {{ report.budget_label }}{% if report.n_providers > 1 %} across {{ report.n_providers }} providers{% endif %}</span></div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Longest incident</div>
+      <div class="row"><span class="value">{{ report.longest.duration if report.longest else '—' }}</span>
+        {% if report.longest %}<span class="note">{{ provider_labels.get(report.longest.provider, report.longest.provider) }} · {{ report.longest.region }}</span>{% endif %}</div>
+    </div>
+  </section>
+
+  <section class="card panel" aria-labelledby="availability-h">
+    <div class="panel-head">
+      <h2 id="availability-h">Availability by provider</h2>
+      {% if current_user and current_user.role == 'admin' %}
+        <a class="link-btn" href="{{ url_for('admin.sla') }}">Targets are editable by admins</a>
+      {% else %}
+        <span style="font-size: 13px; color: var(--muted)">Targets are set by admins</span>
+      {% endif %}
+    </div>
+    {% if report.providers %}
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Provider</th><th class="num">Incidents</th><th class="num">Downtime</th><th class="num">Availability</th><th class="num">Target</th><th>Status</th></tr></thead>
+          <tbody>
+          {% for p in report.providers %}
+            <tr>
+              <td><strong>{{ provider_labels.get(p.provider, p.provider) }}</strong>
+                {% if p.regions %}<div class="region">{{ p.regions }}</div>{% endif %}</td>
+              <td class="num">{{ p.incidents }}</td>
+              <td class="num">{{ p.downtime_label }}</td>
+              <td class="num tone-{{ 'bad' if p.availability < p.target else 'good' }}">{{ p.availability_label }}</td>
+              <td class="num">{{ p.target_label }}</td>
+              <td><span class="badge {{ p.tone }}">{{ p.status }}</span></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="empty">No provider in view.</div>
+    {% endif %}
+    <div class="foot">Downtime runs from the first to the last status-page update, clamped to this window. Overlapping incidents at one provider count once; downtime at different providers is added. Open incidents count up to now and are marked <span class="badge warn">ongoing</span> below. Maintenance is excluded by default.</div>
+  </section>
+
+  <section class="card panel" aria-labelledby="months-h">
+    <div class="panel-head"><h2 id="months-h">Monthly downtime</h2><span style="font-size: 13px; color: var(--muted)">minutes of vendor downtime</span></div>
+    <div class="months">
+      {% for m in report.months %}
+        <div class="month"><div class="bar {{ m.tone }}" style="height: {{ m.height }}px" title="{{ m.minutes }} min in {{ m.key }}">{{ m.minutes }}</div>{{ m.label }}</div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="card panel" aria-labelledby="period-incidents-h">
+    <div class="panel-head"><h2 id="period-incidents-h">Incidents in this period</h2><span style="font-size: 13px; color: var(--muted)">{{ report.incident_count + report.maintenance_count }} record{{ '' if report.incident_count + report.maintenance_count == 1 else 's' }}</span></div>
+    {% if report.shown %}
+      <div class="scroll">
+        <table style="min-width: 900px">
+          <thead><tr><th>Started</th><th>Provider · region</th><th>Incident</th><th>Type</th><th class="num">Duration</th><th>Notes</th></tr></thead>
+          <tbody>
+          {% for item in report.shown %}
+            <tr>
+              <td class="nowrap sub">{{ item.begin.strftime('%d %b %H:%M') }}</td>
+              <td class="nowrap"><strong>{{ provider_labels.get(item.provider, item.provider) }}</strong><div class="region">{{ item.region }}</div></td>
+              <td>{% if item.link %}<a class="incident-title" href="{{ item.link }}" target="_blank" rel="noopener">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}</td>
+              <td class="nowrap"><span class="badge {{ item.kind }}">{{ item.kind }}</span></td>
+              <td class="num">{{ item.duration }}</td>
+              <td class="sub">{{ item.notes or '—' }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if report['items']|length > report.shown|length %}
+        <div class="foot">Showing the first {{ report.shown|length }} of {{ report['items']|length }} records. <a href="{{ link(format='csv') }}">Export CSV</a> for all of them.</div>
+      {% endif %}
+    {% else %}
+      <div class="empty">No incidents in this period.</div>
+    {% endif %}
+  </section>
+
+  <footer>
+    <span>Skyfarer · availability from feed-reported times</span>
+    <span class="mono">rendered {{ now.strftime('%Y-%m-%d %H:%M UTC') }}</span>
+  </footer>
+</main>
+{% endblock %}
+{% block scripts %}
+<script>
+  // Picking dates means a custom range, even if a preset was selected before.
+  document.querySelectorAll("[data-history-date]").forEach(function (input) {
+    input.addEventListener("change", function () {
+      document.getElementById("history-filter").querySelector("[name=range]").value = "custom";
+    });
+  });
+</script>
+{% endblock %}
