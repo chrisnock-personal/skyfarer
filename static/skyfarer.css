@@ -279,7 +279,7 @@ details.replace .new { display: flex; flex-direction: column; gap: 8px; }
 .stored.bad { border-color: var(--bad); background: var(--bad-bg); }
 
 /* ─── History & SLA ───────────────────────────────────────────────────────── */
-.months { display: grid; grid-template-columns: repeat(12, minmax(54px, 1fr)); gap: 6px; padding: 20px; align-items: end; overflow-x: auto; }
+.months { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(54px, 1fr); gap: 6px; padding: 20px; align-items: end; overflow-x: auto; }
 .month { text-align: center; font-size: 11px; color: var(--muted); }
 .month .bar { border-radius: 5px 5px 0 0; background: var(--bar); display: flex; align-items: flex-end; justify-content: center; padding-bottom: 5px; color: var(--text); font-size: 11px; font-variant-numeric: tabular-nums; }
 .month .bar.warn { background: rgba(242,154,84,.75); }

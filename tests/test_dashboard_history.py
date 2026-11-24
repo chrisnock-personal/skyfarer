@@ -57,6 +57,14 @@ class HistoryPage(unittest.TestCase):
         self.assertIn("Export CSV", html)
         self.assertNotIn("SLA_TARGET_DIGITALOCEAN", html)
 
+    def test_switched_off_providers_dont_dilute_the_totals(self):
+        # watched_regions() is mocked to two providers; the other seven are off.
+        with mock.patch.object(dashboard.history, "build",
+                               wraps=dashboard.history.build) as build, \
+                dashboard.app.test_request_context("/history?range=quarter"):
+            dashboard.history_page()
+        self.assertEqual(set(build.call_args.args[3]), {"DigitalOcean", "Hetzner"})
+
     def test_csv_download(self):
         with dashboard.app.test_request_context("/history?range=quarter&format=csv"):
             response = dashboard.history_page()

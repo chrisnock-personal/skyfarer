@@ -137,7 +137,7 @@ def _months(start: datetime, end: datetime) -> list[str]:
     while cursor <= last:
         keys.append(cursor.strftime("%Y-%m"))
         cursor = (cursor + timedelta(days=32)).replace(day=1)
-    return keys[-12:]
+    return keys
 
 
 def _month_of(value: datetime) -> datetime:
@@ -168,7 +168,7 @@ def monthly(items: list[dict], start: datetime, end: datetime, target: float) ->
                    - datetime.strptime(key, "%Y-%m").replace(tzinfo=timezone.utc)).total_seconds() / 60
         allowed *= (100 - target) / 100
         out.append({"key": key,
-                    "label": datetime.strptime(key, "%Y-%m").strftime("%b"),
+                    "label": datetime.strptime(key, "%Y-%m").strftime("%b %y"),
                     "minutes": round(value),
                     "height": max(4, round(80 * value / peak)) if value else 4,
                     "tone": "bad" if value > allowed else "warn" if value else ""})
@@ -278,6 +278,12 @@ CSV_COLUMNS = ("Started (UTC)", "Ended (UTC)", "Provider", "Region", "Incident",
                "Type", "Duration (min)", "Notes", "Link")
 
 
+def _cell(text: str) -> str:
+    """Provider text such as titles is untrusted: stop a spreadsheet reading a
+    leading = + - @ as a formula."""
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
 def csv_export(report: dict) -> str:
     out = io.StringIO(newline="")
     writer = csv.writer(out)
@@ -286,7 +292,7 @@ def csv_export(report: dict) -> str:
         writer.writerow([
             item["begin"].strftime("%Y-%m-%d %H:%M"),
             item["end"].strftime("%Y-%m-%d %H:%M"),
-            item["provider"], item["region"], item["title"], item["kind"],
-            f"{item['minutes']:.1f}", item["notes"], item["link"],
+            _cell(item["provider"]), _cell(item["region"]), _cell(item["title"]),
+            item["kind"], f"{item['minutes']:.1f}", item["notes"], _cell(item["link"]),
         ])
     return out.getvalue()

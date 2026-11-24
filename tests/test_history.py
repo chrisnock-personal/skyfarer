@@ -150,7 +150,19 @@ class Report(unittest.TestCase):
         self.assertEqual(months["2026-11"], 30)
 
 
+    def test_a_year_shows_every_month_it_touches(self):
+        months = run([], NOW - timedelta(days=365), NOW, self.targets)["months"]
+        self.assertEqual(len(months), 13)
+        self.assertEqual((months[0]["key"], months[-1]["key"]), ("2025-11", "2026-11"))
+
+
 class Export(unittest.TestCase):
+    def test_formula_like_titles_are_neutralised(self):
+        rows = [incident(detected=NOW - timedelta(minutes=5), resolved=NOW,
+                         title='=HYPERLINK("x")')]
+        text = history.csv_export(run(rows, NOW - timedelta(days=1), NOW, {"DigitalOcean": 99.9}))
+        self.assertIn("'=HYPERLINK", text)
+
     def test_csv_has_every_incident_and_its_numbers(self):
         start = NOW - timedelta(days=7)
         rows = [incident(detected=NOW - timedelta(minutes=12), resolved=NOW, state="open"),
