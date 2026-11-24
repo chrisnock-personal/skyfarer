@@ -226,8 +226,36 @@ CHANNELS = (
     )),
 )
 
+OIDC_FIELDS = (
+    Field("OIDC_ENABLED", "Allow single sign-on", "bool", default="false"),
+    Field("OIDC_ISSUER", "Issuer URL",
+          help="The provider's exact issuer URL, e.g. https://id.example.com. "
+               "Use the URL from its discovery document, not a login page."),
+    Field("OIDC_CLIENT_ID", "Client ID"),
+    Field("OIDC_CLIENT_SECRET", "Client secret", "secret"),
+    Field("OIDC_REDIRECT_URI", "Redirect URI",
+          help="Optional. Leave blank to use the dashboard's own /oidc/callback URL."),
+    Field("OIDC_SCOPES", "Scopes", default="openid email profile groups",
+          help="Include openid and a scope that yields email and group claims."),
+    Field("OIDC_GROUP_CLAIM", "Groups claim", default="groups",
+          help="Claim holding group names; dot notation works for nested claims."),
+    Field("OIDC_ROLE_CLAIM", "Role claim",
+          help="Optional claim holding 'admin' or 'viewer'; takes precedence over groups."),
+    Field("OIDC_ADMIN_EMAILS", "Admins by email", "list",
+          help="Signed-in email addresses that get the admin role."),
+    Field("OIDC_VIEWER_EMAILS", "Viewers by email", "list",
+          help="Signed-in email addresses that get the viewer role."),
+    Field("OIDC_ADMIN_GROUPS", "Admin groups", "list",
+          help="Group names from the groups claim that get the admin role."),
+    Field("OIDC_VIEWER_GROUPS", "Viewer groups", "list",
+          help="Group names from the groups claim that get the viewer role."),
+    Field("OIDC_CREATE_USERS", "Create accounts on first sign-in", "bool", default="true",
+          help="Off: only people who already have a Skyfarer account can use SSO."),
+    Field("OIDC_REQUIRE_VERIFIED_EMAIL", "Require a verified email", "bool", default="true"),
+)
+
 CHANNEL_BY_ID = {c.id: c for c in CHANNELS}
-FIELDS = {f.key: f for f in (GENERAL + RULES + PROVIDER_API_KEY_FIELDS
+FIELDS = {f.key: f for f in (GENERAL + RULES + PROVIDER_API_KEY_FIELDS + OIDC_FIELDS
                              + tuple(f for c in CHANNELS for f in c.fields))}
 
 # Every key apply() manages in the environment.
@@ -568,9 +596,18 @@ def check(conn, changes: dict[str, Optional[str]], hooks: Optional[list] = None)
     with _apply_lock:
         try:
             _configure(trial, current_hooks if hooks is None else hooks)
-            return notifiers.config_errors()
+            problems = notifiers.config_errors()
         finally:
             _configure(values, current_hooks)
+    # The sign-in settings have no poller to check them, so check them here:
+    # the dashboard form and API settings writes share this validation.
+    if trial.get("OIDC_ENABLED", "").lower() in ("1", "true", "yes", "on"):
+        import oidc
+        try:
+            oidc.require_config(trial)
+        except oidc.OidcError as err:
+            problems.append(str(err))
+    return problems
 
 
 # ─── First start ────────────────────────────────────────────────────────────
@@ -668,6 +705,17 @@ def user(conn, user_id: int) -> Optional[dict]:
     return rows[0] if rows else None
 
 
+def user_by_email(conn, email: str) -> Optional[dict]:
+    rows = _rows(conn, "SELECT id, email, name, role, kind FROM users WHERE email = lower(%s)",
+                 (email.strip(),))
+    return rows[0] if rows else None
+
+
+def record_sso_login(conn, user_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE users SET last_login = NOW() WHERE id = %s", (user_id,))
+
+
 def admin_count(conn) -> int:
     return _rows(conn, "SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")[0]["n"]
 
@@ -681,13 +729,15 @@ def password_problem(password: str, confirm: Optional[str] = None) -> Optional[s
 
 
 def create_user(conn, email: str, name: str, role: str, actor: str,
-                password: Optional[str] = None, kind: str = "human") -> NewLink:
+                password: Optional[str] = None, kind: str = "human",
+                sso: bool = False) -> NewLink:
     """Create an account. Without a password, it gets a setup link instead,
-    returned once and stored only as a hash."""
+    returned once and stored only as a hash. SSO accounts get neither: they
+    sign in through the identity provider."""
     from werkzeug.security import generate_password_hash
     if role not in ROLES:
         raise ValueError(role)
-    token = None if password or kind == "service" else secrets.token_urlsafe(32)
+    token = None if password or kind == "service" or sso else secrets.token_urlsafe(32)
     with conn.cursor() as cur:
         # With a password, it's the first admin, signed in as the account is made.
         cur.execute("""INSERT INTO users (email, name, role, kind, password_hash, setup_token,
@@ -700,7 +750,8 @@ def create_user(conn, email: str, name: str, role: str, actor: str,
                      datetime.now(timezone.utc) if password else None))
         user_id = cur.fetchone()[0]
     history_add(conn, actor, f"Added {name.strip()} ({role})"
-                + ("" if password else " and created a setup link"))
+                + ("" if password or sso else " and created a setup link")
+                + (" via SSO" if sso else ""))
     return NewLink(user_id, token or "")
 
 

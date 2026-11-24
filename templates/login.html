@@ -18,6 +18,14 @@
     <input class="input" id="password" name="password" type="password" autocomplete="current-password" required>
   </div>
   <button type="submit" class="btn primary">Sign in</button>
+  {% if oidc_available %}
+  <div style="display: flex; align-items: center; gap: 10px">
+    <span style="flex: 1; height: 1px; background: var(--border)"></span>
+    <span class="hint">or</span>
+    <span style="flex: 1; height: 1px; background: var(--border)"></span>
+  </div>
+  <a class="btn" style="width: 100%" href="{{ url_for('admin.oidc_login', next=next) }}">Sign in with your identity provider</a>
+  {% endif %}
   <p class="hint">Forgotten your password? An admin can give you a new setup link.</p>
 </form>
 {% endblock %}

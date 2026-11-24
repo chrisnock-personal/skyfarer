@@ -212,6 +212,10 @@ dashboard:
   defaulting to 99.90%.
 - **API tokens.** Named bearer tokens with per-resource scopes, plus service
   accounts to own them. Shown once, stored only as a hash.
+- **Single sign-on.** Optional OIDC authorization code with PKCE. Map an
+  identity provider's role claim, emails or groups to admin/viewer; new people
+  can be created on first sign-in. Local passwords stay as a fallback. See
+  [docs/oidc.md](docs/oidc.md).
 - **Users and access.** Admins see and change everything; viewers see the
   dashboard and nothing under Settings. There's always at least one admin, and
   nobody can change their own role.
@@ -242,6 +246,11 @@ one-time setup link to pass on (Skyfarer sends no email); it expires after 24
 hours. The same is how a forgotten password is reset. Passwords are hashed
 (scrypt); after five wrong attempts for one email from one address, that pair
 waits 15 minutes.
+
+With OIDC enabled, the login page also offers the provider's sign-in. The first
+admin still comes from the setup code; provider claims only map to roles after
+the signed ID token has been checked. Details and provider setup are in
+[docs/oidc.md](docs/oidc.md).
 Sessions last 12 hours. Behind an HTTPS proxy, set `DASHBOARD_HTTPS=true`: the
 session cookie is then only sent over HTTPS, and the dashboard takes the
 client's address, scheme and host from the proxy's `X-Forwarded-*` headers (for
