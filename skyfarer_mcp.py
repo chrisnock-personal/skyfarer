@@ -23,7 +23,8 @@ from typing import Optional
 import cli
 
 PROTOCOL_VERSION = "2026-07-28"
-# Older clients still open with initialize; echo their version back to them.
+# Older clients still open with initialize: a version listed here is echoed
+# back; any other gets the newest one we support, as MCP asks.
 LEGACY_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05",
                    "2024-10-07")
 SERVER_INFO = {"name": "skyfarer", "version": "1.0.0"}
@@ -244,7 +245,14 @@ def tool_set_provider(client, args):
 
 
 def tool_test_channel(client, args):
-    return client.post(f"/channels/{args['id']}/test", {})
+    cid = str(args.get("id", "")).strip()
+    # Webhooks have their own test endpoint; webhook-4 means webhook id 4.
+    if cid.startswith("webhook-"):
+        hook_id = cid[len("webhook-"):]
+        if not hook_id.isdigit():
+            raise cli.CliError("A webhook id looks like webhook-4.", cli.EXIT_USAGE)
+        return client.post(f"/webhooks/{hook_id}/test", {})
+    return client.post(f"/channels/{cid}/test", {})
 
 
 def tool_add_webhook(client, args):
@@ -307,8 +315,9 @@ def _call_tool(client, params: dict, tools: list, allow_writes: bool) -> dict:
     if not isinstance(args, dict):
         raise RpcError(-32602, "Tool arguments must be an object.")
     if name not in {t["name"] for t in tools}:
+        # MCP treats an unknown tool as a protocol error, not a tool result.
         hint = "" if allow_writes else " Start with --allow-writes for admin tools."
-        return _tool_result(f"Unknown tool {name!r}.{hint}", True)
+        raise RpcError(-32602, f"Unknown tool {name!r}.{hint}")
     try:
         result = HANDLERS[name](client, args)
     except cli.CliError as err:
@@ -334,7 +343,8 @@ def dispatch(method: str, params: dict, client, *, allow_writes: bool = False) -
                 "instructions": instructions,
                 "ttlMs": 3_600_000, "cacheScope": "public"}
     if method == "initialize":        # 2025-11-25 and earlier clients
-        version = params.get("protocolVersion") or PROTOCOL_VERSION
+        asked = params.get("protocolVersion")
+        version = asked if asked in (PROTOCOL_VERSION, *LEGACY_VERSIONS) else PROTOCOL_VERSION
         return {"resultType": "complete", "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": SERVER_INFO, "instructions": instructions}

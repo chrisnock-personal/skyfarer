@@ -147,7 +147,7 @@ password, no sign-in) to own the token. Revoke a token from the same page; its
 Counters are in Postgres, so several dashboard workers share them.
 
 ```sh
-export SKYFARER_URL=http://192.168.1.195:8083
+export SKYFARER_URL=http://127.0.0.1:8080
 export SKYFARER_TOKEN=sk_live_…        # or put both in ~/.config/skyfarer/config.toml
 skyfarer status
 skyfarer incidents list --state open --json

@@ -12,7 +12,7 @@ The server is installed alongside the CLI, from the container image or with
 `pipx install .` in the repo:
 
 ```sh
-export SKYFARER_URL=http://192.168.1.195:8083
+export SKYFARER_URL=http://127.0.0.1:8080
 export SKYFARER_TOKEN=sk_live_…        # or put both in a CLI profile
 skyfarer-mcp                           # read-only tools
 skyfarer-mcp --allow-writes            # also expose admin tools
@@ -32,7 +32,7 @@ For an MCP client such as Claude Desktop, add a server entry like this:
     "skyfarer": {
       "command": "skyfarer-mcp",
       "env": {
-        "SKYFARER_URL": "http://192.168.1.195:8083",
+        "SKYFARER_URL": "http://127.0.0.1:8080",
         "SKYFARER_TOKEN": "sk_live_…"
       }
     }

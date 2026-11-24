@@ -70,6 +70,10 @@ class Handshake(unittest.TestCase):
         self.assertEqual(reply["result"]["protocolVersion"], "2025-11-25")
         self.assertIn("tools", reply["result"]["capabilities"])
 
+    def test_initialize_with_an_unknown_version_gets_ours(self):
+        reply, = run_server([request("initialize", {"protocolVersion": "1999-01-01"})])
+        self.assertEqual(reply["result"]["protocolVersion"], mcp.PROTOCOL_VERSION)
+
     def test_ping_and_empty_lists(self):
         replies = run_server([request("ping"), request("resources/list"),
                               request("prompts/list")])
@@ -148,10 +152,20 @@ class Tools(unittest.TestCase):
         self.assertIn("invalid or revoked", reply["result"]["content"][0]["text"])
         self.assertNotIn("error", reply)
 
-    def test_unknown_tool_is_a_tool_error_with_a_hint(self):
+    def test_unknown_tool_is_a_protocol_error_with_a_hint(self):
         reply, = run_server([request("tools/call", {"name": "skyfarer_create_token"})])
-        self.assertTrue(reply["result"]["isError"])
-        self.assertIn("--allow-writes", reply["result"]["content"][0]["text"])
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("--allow-writes", reply["error"]["message"])
+
+    def test_test_channel_sends_webhooks_to_their_own_endpoint(self):
+        client = FakeClient({"ok": True, "message": "sent"})
+        run_server([request("tools/call", {"name": "skyfarer_test_channel",
+                                           "arguments": {"id": "webhook-4"}}, msg_id=1),
+                    request("tools/call", {"name": "skyfarer_test_channel",
+                                           "arguments": {"id": "zendesk"}}, msg_id=2)],
+                   client, allow_writes=True)
+        self.assertEqual([c[1] for c in client.calls],
+                         ["/webhooks/4/test", "/channels/zendesk/test"])
 
     def test_write_tools_call_the_api(self):
         client = FakeClient({"changed": []})
