@@ -22,12 +22,20 @@ be the only way into an empty installation.
    - **admin/viewer groups** — group names from the groups claim (default
      `groups`, also dot-addressable).
 
-   Admin wins over viewer. On every sign-in the mapped role is applied, so
-   changing someone's groups at the provider changes their Skyfarer role.
+   Every source counts, and admin from any of them wins over viewer: a role
+   claim of `viewer` doesn't stop an email or group on the admin list. On
+   every sign-in the mapped role is applied, so changing someone's groups at
+   the provider changes their Skyfarer role.
 4. Leave "Create accounts on first sign-in" on to add new people automatically
    from the verified email and name claims. Turn it off to require an admin to
    add each account first. "Require a verified email" is on by default and
    should stay on.
+
+   The first SSO sign-in to an account links it to that person's issuer and
+   subject (`sub`) at the provider; after that only the same identity can use
+   it, even if someone else at the provider later shows the same email. With
+   verified emails not required, SSO creates new accounts but won't link to
+   an existing one, such as the local first admin.
 
 The same keys can be set from `.env` on first start (`OIDC_ENABLED`,
 `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, the mapping lists, etc.),

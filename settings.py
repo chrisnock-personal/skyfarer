@@ -240,7 +240,7 @@ OIDC_FIELDS = (
     Field("OIDC_GROUP_CLAIM", "Groups claim", default="groups",
           help="Claim holding group names; dot notation works for nested claims."),
     Field("OIDC_ROLE_CLAIM", "Role claim",
-          help="Optional claim holding 'admin' or 'viewer'; takes precedence over groups."),
+          help="Optional claim holding 'admin' or 'viewer'. Admin from any source wins."),
     Field("OIDC_ADMIN_EMAILS", "Admins by email", "list",
           help="Signed-in email addresses that get the admin role."),
     Field("OIDC_VIEWER_EMAILS", "Viewers by email", "list",
@@ -706,14 +706,18 @@ def user(conn, user_id: int) -> Optional[dict]:
 
 
 def user_by_email(conn, email: str) -> Optional[dict]:
-    rows = _rows(conn, "SELECT id, email, name, role, kind FROM users WHERE email = lower(%s)",
-                 (email.strip(),))
+    rows = _rows(conn, """SELECT id, email, name, role, kind, oidc_subject
+                            FROM users WHERE email = lower(%s)""", (email.strip(),))
     return rows[0] if rows else None
 
 
-def record_sso_login(conn, user_id: int) -> None:
+def record_sso_login(conn, user_id: int, subject: str) -> None:
+    """Note the sign-in and link the account to this identity, so later
+    sign-ins must come from the same issuer and subject, not just the email."""
     with conn.cursor() as cur:
-        cur.execute("UPDATE users SET last_login = NOW() WHERE id = %s", (user_id,))
+        cur.execute("""UPDATE users SET last_login = NOW(),
+                              oidc_subject = COALESCE(oidc_subject, %s)
+                        WHERE id = %s""", (subject, user_id))
 
 
 def admin_count(conn) -> int:

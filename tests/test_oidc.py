@@ -40,7 +40,7 @@ META = {
     "token_endpoint": "https://id.example.test/token",
     "jwks_uri": "https://id.example.test/keys",
     "userinfo_endpoint": "https://id.example.test/userinfo",
-    "id_token_signing_alg_values_supports": ["RS256"],
+    "id_token_signing_alg_values_supported": ["RS256"],
 }
 
 
@@ -112,9 +112,13 @@ class Helpers(unittest.TestCase):
         self.assertEqual(query["redirect_uri"], ["https://sf.test/oidc/callback"])
 
     def test_role_maps_role_claim_emails_and_groups_with_admin_winning(self):
+        # A viewer role claim doesn't outrank an admin email: admin wins.
         self.assertEqual(oidc.role_for({"custom_role": "viewer",
                                         "email": "boss@example.test"},
-                                       dict(VALUES, OIDC_ROLE_CLAIM="custom_role")), "viewer")
+                                       dict(VALUES, OIDC_ROLE_CLAIM="custom_role")), "admin")
+        self.assertEqual(oidc.role_for({"custom_role": "admin",
+                                        "email": "Person@Example.test"},
+                                       dict(VALUES, OIDC_ROLE_CLAIM="custom_role")), "admin")
         self.assertEqual(oidc.role_for({"email": "Person@Example.test"}, VALUES), None)
         self.assertEqual(oidc.role_for({"email": "Person@Example.test"},
                                        dict(VALUES, OIDC_VIEWER_EMAILS="person@example.test")),
@@ -135,13 +139,27 @@ class Helpers(unittest.TestCase):
             with self.assertRaises(oidc.OidcError):
                 oidc.discovery(VALUES)
         with mock.patch.object(oidc.requests, "get", return_value=FakeResponse(
-                dict(META, id_token_signing_alg_values_supports=["HS256"]))):
+                dict(META, id_token_signing_alg_values_supported=["HS256"]))):
             with self.assertRaises(oidc.OidcError):
                 oidc.discovery(VALUES)
         with mock.patch.object(oidc.requests, "get", return_value=FakeResponse(META)) as get:
             self.assertEqual(oidc.discovery(VALUES)["token_endpoint"], META["token_endpoint"])
         self.assertEqual(get.call_args.args[0],
                          "https://id.example.test/.well-known/openid-configuration")
+
+    def test_discovery_appends_the_well_known_path_to_an_issuer_with_a_path(self):
+        issuer = "https://kc.example.test/realms/ops"
+        meta = dict(META, issuer=issuer)
+        with mock.patch.object(oidc.requests, "get", return_value=FakeResponse(meta)) as get:
+            oidc.discovery(dict(VALUES, OIDC_ISSUER=issuer))
+        self.assertEqual(get.call_args.args[0],
+                         "https://kc.example.test/realms/ops/.well-known/openid-configuration")
+
+    def test_discovery_endpoints_must_really_be_local_to_use_http(self):
+        meta = dict(META, token_endpoint="http://localhost.evil.test/token")
+        with mock.patch.object(oidc.requests, "get", return_value=FakeResponse(meta)):
+            with self.assertRaises(oidc.OidcError):
+                oidc.discovery(VALUES)
 
     def test_exchange_code_sends_pkce_verifier_and_rejects_errors(self):
         with mock.patch.object(oidc.requests, "post", return_value=FakeResponse(
@@ -195,9 +213,10 @@ class Tokens(unittest.TestCase):
             claims = oidc.identity(VALUES, tokens, "nonce-1", META)
         self.assertEqual(claims["email"], "Person@Example.test")  # signed token wins
         self.assertEqual(oidc.role_for(claims, VALUES), "viewer")
-        with mock.patch.object(oidc, "userinfo", return_value={"sub": "someone-else"}):
-            with self.assertRaises(oidc.OidcError):
-                oidc.identity(VALUES, tokens, "nonce-1", META)
+        for other in ({"sub": "someone-else"}, {"email": "x@example.test"}):
+            with mock.patch.object(oidc, "userinfo", return_value=other):
+                with self.assertRaises(oidc.OidcError):
+                    oidc.identity(VALUES, tokens, "nonce-1", META)
         unverified = make_jwt(self.key, id_claims(email_verified=False))
         with mock.patch.object(oidc, "userinfo", return_value={}):
             with self.assertRaises(oidc.OidcError):
@@ -268,7 +287,7 @@ class Web(unittest.TestCase):
                           oidc_redirect_uri="https://sf.test/oidc/callback",
                           oidc_next="/history")
         claims = {"email": "Person@Example.test", "name": "Person",
-                  "groups": ["read-only"]}
+                  "groups": ["read-only"], "iss": "https://id.example.test", "sub": "p-1"}
         with mock.patch.object(oidc, "discovery", return_value=META), \
                 mock.patch.object(oidc, "exchange_code", return_value={"id_token": "i"}), \
                 mock.patch.object(oidc, "identity", return_value=claims), \
@@ -281,7 +300,7 @@ class Web(unittest.TestCase):
         self.assertEqual(response.headers["Location"], "/history")
         self.assertEqual(create.call_args.args[3], "viewer")
         self.assertTrue(create.call_args.kwargs["sso"])
-        record.assert_called_once_with(self.conn, 42)
+        record.assert_called_once_with(self.conn, 42, "https://id.example.test|p-1")
         with self.client.session_transaction() as sess:
             self.assertEqual(sess["uid"], 42)
             self.assertNotIn("oidc_state", sess)
@@ -300,6 +319,37 @@ class Web(unittest.TestCase):
             response = self.client.get("/oidc/callback?code=c&state=right")
         self.assertEqual(response.status_code, 302)
         role.assert_called_once_with(self.conn, 7, "admin", "SSO")
+
+    def callback_for(self, person, *, values=None):
+        self.with_session(oidc_state="right", oidc_nonce="n", oidc_verifier="v",
+                          oidc_redirect_uri="https://sf.test/oidc/callback")
+        self.values.update(values or {})
+        claims = {"email": "boss@example.test", "name": "Boss",
+                  "iss": "https://id.example.test", "sub": "boss-1"}
+        with mock.patch.object(oidc, "discovery", return_value=META), \
+                mock.patch.object(oidc, "exchange_code", return_value={"id_token": "i"}), \
+                mock.patch.object(oidc, "identity", return_value=claims), \
+                mock.patch.object(settings, "user_by_email", return_value=person), \
+                mock.patch.object(settings, "set_role", return_value=None), \
+                mock.patch.object(settings, "record_sso_login") as record:
+            self.client.get("/oidc/callback?code=c&state=right")
+        with self.client.session_transaction() as sess:
+            return sess.get("uid"), record
+
+    def test_an_account_linked_to_another_identity_is_refused(self):
+        uid, record = self.callback_for({"id": 7, "role": "admin", "kind": "human",
+                                         "oidc_subject": "https://id.example.test|someone"})
+        self.assertIsNone(uid)
+        record.assert_not_called()
+        uid, record = self.callback_for({"id": 7, "role": "admin", "kind": "human",
+                                         "oidc_subject": "https://id.example.test|boss-1"})
+        self.assertEqual(uid, 7)
+
+    def test_unverified_emails_cannot_open_an_existing_account(self):
+        uid, record = self.callback_for({"id": 1, "role": "admin", "kind": "human"},
+                                        values={"OIDC_REQUIRE_VERIFIED_EMAIL": "false"})
+        self.assertIsNone(uid)
+        record.assert_not_called()
 
     def test_a_service_account_cannot_sign_in_through_sso(self):
         self.with_session(oidc_state="right", oidc_nonce="n", oidc_verifier="v",

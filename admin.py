@@ -257,11 +257,23 @@ def oidc_callback():
             if role is None:
                 raise oidc.OidcError("This account isn't mapped to a Skyfarer role.")
             email = str(claims["email"]).strip().lower()
+            sub_id = oidc.subject(claims)
             person = settings.user_by_email(conn, email)
             if person:
                 if person["kind"] == "service":
                     raise oidc.OidcError("Service accounts can't sign in. Use a "
                                          "human account for single sign-on.")
+                linked = person.get("oidc_subject")
+                if linked and linked != sub_id:
+                    raise oidc.OidcError("This Skyfarer account is linked to a "
+                                         "different single sign-on identity.")
+                if not linked and not oidc.truthy(
+                        values.get("OIDC_REQUIRE_VERIFIED_EMAIL"), True):
+                    # An unverified email is only a claim: it mustn't open
+                    # an existing account, such as the first admin's.
+                    raise oidc.OidcError("Existing accounts can only be linked to "
+                                         "single sign-on when verified emails are "
+                                         "required.")
                 user_id = person["id"]
                 if person["role"] != role:
                     reason = settings.set_role(conn, user_id, role, "SSO")
@@ -273,7 +285,7 @@ def oidc_callback():
                                          "you can use single sign-on.")
                 user_id = settings.create_user(conn, email, oidc.display_name(claims),
                                                role, "SSO", sso=True).user_id
-            settings.record_sso_login(conn, user_id)
+            settings.record_sso_login(conn, user_id, sub_id)
         except oidc.OidcError as err:
             flash(str(err), "bad")
             return redirect(url_for("admin.login", next=nxt))

@@ -252,6 +252,8 @@ def init_schema():
             cur.execute("SELECT pg_advisory_xact_lock(77700)")
             cur.execute(SCHEMA_SQL)
             # Added for the API's service accounts; safe to run repeatedly.
+            # Single sign-on links an account to the provider's issuer|sub.
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_subject TEXT")
             cur.execute("""ALTER TABLE users ADD COLUMN IF NOT EXISTS kind
                            TEXT NOT NULL DEFAULT 'human'
                            CHECK (kind IN ('human', 'service'))""")

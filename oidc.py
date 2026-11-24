@@ -59,12 +59,15 @@ def enabled(values: dict) -> bool:
     return truthy(values.get("OIDC_ENABLED"), False)
 
 
-def _valid_url(value: str, *, what: str, web_only: bool = True) -> str:
+def _valid_url(value: str, *, what: str, web_only: bool = True,
+               allow_query: bool = False) -> str:
     value = (value or "").strip()
     parts = urlsplit(value)
+    # Compare the parsed host, so http://localhost.evil.test isn't "local".
     local = (parts.hostname or "").lower() in LOCAL_HOSTS
     if parts.scheme not in ("https", "http") or not parts.netloc or \
-            parts.query or parts.fragment or (web_only and parts.scheme == "http" and not local):
+            (parts.query and not allow_query) or parts.fragment or \
+            (web_only and parts.scheme == "http" and not local):
         raise OidcError(f"{what} must be an absolute https URL (http is only "
                         "allowed for localhost).")
     return value.rstrip("/") if what == "Issuer URL" else value
@@ -110,17 +113,19 @@ def discovery(values: dict) -> dict:
     require_config(values)
     issuer = values["OIDC_ISSUER"].strip().rstrip("/")
     parts = urlsplit(issuer)
-    # OIDC Discovery puts the well-known path before the issuer's path.
-    discovery_url = (f"{parts.scheme}://{parts.netloc}/.well-known/openid-configuration"
-                     + parts.path.rstrip("/"))
+    # OIDC Discovery 1.0 appends the well-known path to the whole issuer, path
+    # included (https://kc.example/realms/ops/.well-known/...). Putting it
+    # before the path is RFC 8414's rule for OAuth servers, not OIDC.
+    discovery_url = f"{issuer}/.well-known/openid-configuration"
     meta = _get(discovery_url, "discovery document")
     if str(meta.get("issuer", "")).rstrip("/") != issuer:
         raise OidcError("The provider's issuer URL doesn't match the saved one.")
     for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
-        if not str(meta.get(key, "")).startswith(("https://", "http://localhost",
-                                                  "http://127.0.0.1")):
-            raise OidcError(f"The discovery document has no usable {key}.")
-    algs = meta.get("id_token_signing_alg_values_supports") or [ALGORITHM]
+        try:
+            _valid_url(str(meta.get(key, "")), what=key, allow_query=True)
+        except OidcError:
+            raise OidcError(f"The discovery document has no usable {key}.") from None
+    algs = meta.get("id_token_signing_alg_values_supported") or [ALGORITHM]
     if ALGORITHM not in algs:
         raise OidcError("The provider doesn't sign ID tokens with RS256, which "
                         "Skyfarer requires.")
@@ -250,9 +255,13 @@ def userinfo(values: dict, access_token: str, meta: dict) -> dict:
 def identity(values: dict, tokens: dict, nonce: str, meta: dict) -> dict:
     """Return the combined, verified claims used for role mapping."""
     claims = verify_id_token(values, tokens["id_token"], nonce, meta)
+    if not str(claims.get("sub") or "").strip():
+        raise OidcError("The ID token has no subject.")
     extra = userinfo(values, tokens["access_token"], meta)
     if extra:
-        if claims.get("sub") and extra.get("sub") and extra["sub"] != claims["sub"]:
+        # sub is required in both; a userinfo answer without it can't be
+        # shown to belong to this person, so it isn't used.
+        if extra.get("sub") != claims["sub"]:
             raise OidcError("The userinfo response belongs to another identity.")
         merged = dict(extra)
         merged.update(claims)   # the signed ID token wins on overlapping claims
@@ -289,26 +298,27 @@ def _mapped(values: dict, key: str) -> set[str]:
 
 
 def role_for(claims: dict, values: dict) -> str | None:
-    """Map the verified claims to a Skyfarer role; admin wins over viewer."""
+    """Map the verified claims to a Skyfarer role. Every source counts (role
+    claim, email lists, group lists), and admin from any of them wins."""
     role_path = values.get("OIDC_ROLE_CLAIM", "").strip()
-    if role_path:
-        roles = {v.casefold() for v in _claim_values(claims, role_path)}
-        if "admin" in roles:
-            return "admin"
-        if "viewer" in roles:
-            return "viewer"
+    roles = ({v.casefold() for v in _claim_values(claims, role_path)}
+             if role_path else set())
     emails = {str(claims.get("email") or "").strip().casefold()}
-    if emails & _mapped(values, "OIDC_ADMIN_EMAILS"):
-        return "admin"
     groups = {v.casefold() for v in
               _claim_values(claims, values.get("OIDC_GROUP_CLAIM", "").strip() or "groups")}
-    if groups & _mapped(values, "OIDC_ADMIN_GROUPS"):
+    if "admin" in roles or emails & _mapped(values, "OIDC_ADMIN_EMAILS") \
+            or groups & _mapped(values, "OIDC_ADMIN_GROUPS"):
         return "admin"
-    if emails & _mapped(values, "OIDC_VIEWER_EMAILS"):
-        return "viewer"
-    if groups & _mapped(values, "OIDC_VIEWER_GROUPS"):
+    if "viewer" in roles or emails & _mapped(values, "OIDC_VIEWER_EMAILS") \
+            or groups & _mapped(values, "OIDC_VIEWER_GROUPS"):
         return "viewer"
     return None
+
+
+def subject(claims: dict) -> str:
+    """The provider's stable ID for this person: issuer plus subject. Unlike an
+    email address, it can't be claimed by someone else at the provider."""
+    return f"{str(claims.get('iss') or '').rstrip('/')}|{claims.get('sub') or ''}"
 
 
 def display_name(claims: dict) -> str:
