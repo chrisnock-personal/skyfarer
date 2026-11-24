@@ -136,6 +136,16 @@ class Tools(unittest.TestCase):
         self.assertIn("id must be an integer", reply["result"]["content"][0]["text"])
         self.assertEqual(client.calls, [])
 
+    def test_poll_log_exposes_and_passes_date_filters(self):
+        tool = next(t for t in mcp.READ_TOOLS if t["name"] == "skyfarer_poll_log")
+        self.assertEqual(set(tool["inputSchema"]["properties"]),
+                         {"range", "from", "to", "limit", "cursor"})
+        client = FakeClient({"items": []})
+        run_server([request("tools/call", {"name": "skyfarer_poll_log", "arguments": {
+            "range": "custom", "from": "2026-11-01", "to": "2026-11-24"}})], client)
+        self.assertEqual(client.calls[0][3], {
+            "range": "custom", "from": "2026-11-01", "to": "2026-11-24"})
+
     def test_history_can_return_csv_text(self):
         client = FakeClient("Started (UTC),Provider\n")
         reply, = run_server([request("tools/call", {

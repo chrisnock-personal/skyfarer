@@ -3,7 +3,7 @@
   "info": {
     "title": "Skyfarer API",
     "version": "1.0.0",
-    "description": "JSON view of Skyfarer for scripts, the CLI and agents. Read endpoints need a bearer token with the matching scope; admin endpoints also need an admin account. Secrets are write-only: GET returns field names and configured flags, never values. Lists use cursor pagination (50 by default, 200 maximum). Errors are application/problem+json. Requests are throttled per token and per IP (429 with Retry-After)."
+    "description": "JSON view of Skyfarer for scripts, the CLI and agents. Read endpoints need a bearer token with the matching scope; admin endpoints also need an admin account. Secrets are write-only: GET returns field names and configured flags, never values. The incident, delivery and poll-cycle lists use cursor pagination (50 by default, 200 maximum); the small admin lists are returned in full. Errors are application/problem+json. Requests are throttled per token and per IP (429 with Retry-After)."
   },
   "servers": [{"url": "/api/v1"}],
   "security": [{"bearerAuth": []}],
@@ -31,8 +31,7 @@
       "Forbidden": {
         "description": "Missing scope or admin role",
         "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
-      },
-      "NotModified": {"description": "Nothing changed"}
+      }
     },
     "schemas": {
       "Problem": {
@@ -152,7 +151,9 @@
     "/poll-log": {
       "get": {"tags": ["read"], "summary": "Poll cycles",
               "parameters": [
-                {"name": "range", "in": "query", "schema": {"type": "string", "default": "all"}},
+                {"name": "range", "in": "query", "schema": {"type": "string", "default": "all", "enum": ["all", "today", "7d", "30d", "90d", "custom"]}},
+                {"name": "from", "in": "query", "schema": {"type": "string", "format": "date"}},
+                {"name": "to", "in": "query", "schema": {"type": "string", "format": "date"}},
                 {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
                 {"name": "cursor", "in": "query", "schema": {"type": "integer"}}
               ],

@@ -197,6 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     polls = sub.add_parser("poll-log", help="Poll cycles")
     polls.add_argument("--range", default="all")
+    polls.add_argument("--from", dest="date_from")
+    polls.add_argument("--to", dest="date_to")
     polls.add_argument("--limit", type=int, default=50)
 
     providers = sub.add_parser("providers", help="Watched providers and regions")
@@ -359,7 +361,9 @@ def run(args: argparse.Namespace) -> int:
                                           "limit": args.limit}), args.json,
                ["id", "created_at", "channel", "status", "incident_title"])
     elif args.command == "poll-log":
-        output(client.get("/poll-log", {"range": args.range, "limit": args.limit}), args.json,
+        params = {"range": args.range, "from": args.date_from, "to": args.date_to,
+                  "limit": args.limit}
+        output(client.get("/poll-log", params), args.json,
                ["id", "polled_at", "entries_seen", "tickets_created", "tickets_resolved",
                 "open_count", "error"])
     elif args.command == "providers":

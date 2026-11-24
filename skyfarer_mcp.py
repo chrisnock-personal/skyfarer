@@ -74,6 +74,8 @@ def _list(description: str) -> dict:
 
 _RANGE = _text("Reporting window: 30d, quarter, year or custom (with from/to).",
                ("30d", "quarter", "year", "custom"))
+_LIST_RANGE = _text("Window: all, today, 7d, 30d, 90d or custom (with from/to).",
+                    ("all", "today", "7d", "30d", "90d", "custom"))
 _DATE = _text("Inclusive start/end date, YYYY-MM-DD (used with range=custom).")
 _PROVIDER = _text("Provider name, e.g. OVH; omit or use 'all' for every provider.")
 _REGION = _text("Region code, e.g. GRA; omit or use 'all' for every region.")
@@ -92,7 +94,7 @@ READ_TOOLS = [
          "state": _text("Which incidents to return.", ("open", "all", "resolved")),
          "provider": _PROVIDER, "region": _REGION,
          "q": _text("Free-text search over titles and summaries."),
-         "range": _RANGE, "from": _DATE, "to": _DATE,
+         "range": _LIST_RANGE, "from": _DATE, "to": _DATE,
          "limit": _LIMIT, "cursor": _CURSOR,
      })},
     {"name": "skyfarer_incident",
@@ -119,7 +121,9 @@ READ_TOOLS = [
     {"name": "skyfarer_poll_log",
      "title": "Poll cycles",
      "description": "Recent poll cycles, for checking that feeds are still being read.",
-     "inputSchema": _schema({"range": _RANGE, "limit": _LIMIT, "cursor": _CURSOR})},
+     "inputSchema": _schema({
+         "range": _LIST_RANGE, "from": _DATE, "to": _DATE,
+         "limit": _LIMIT, "cursor": _CURSOR})},
 ]
 
 WRITE_TOOLS = [
@@ -227,7 +231,7 @@ def tool_deliveries(client, args):
 
 
 def tool_poll_log(client, args):
-    return client.get("/poll-log", _params(args, ("range", "limit", "cursor")))
+    return client.get("/poll-log", _params(args, ("range", "from", "to", "limit", "cursor")))
 
 
 def tool_set_provider(client, args):

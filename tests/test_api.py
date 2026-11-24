@@ -90,6 +90,14 @@ class ApiAuth(unittest.TestCase):
             for method in rule.methods & {"GET", "POST", "PUT", "PATCH", "DELETE"}:
                 self.assertIn(method.lower(), spec["paths"][path], f"{method} {rule.rule}")
 
+    def test_openapi_documents_poll_log_date_filters(self):
+        spec = json.loads(self.client.get("/api/v1/openapi.json").get_data())
+        params = {p["name"] for p in spec["paths"]["/poll-log"]["get"]["parameters"]}
+        self.assertTrue({"from", "to"} <= params)
+        self.assertIn("incident, delivery and poll-cycle lists use cursor pagination",
+                      spec["info"]["description"])
+        self.assertNotIn("NotModified", spec["components"]["responses"])
+
     def test_missing_scope_is_forbidden(self):
         self.patch_token(scopes=("status:read",))
         response = self.client.get("/api/v1/history",
@@ -421,6 +429,16 @@ class CliClient(unittest.TestCase):
             code = cli.main(["--json", "status"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue()), {"summary": {"open": 1}})
+
+    def test_poll_log_passes_date_filters(self):
+        with mock.patch.object(cli, "load_profile", return_value={"url": "http://x", "token": "t"}), \
+                mock.patch.object(cli.Client, "get", return_value={"items": []}) as get, \
+                mock.patch("sys.stdout", io.StringIO()):
+            code = cli.main(["--json", "poll-log", "--range", "custom",
+                             "--from", "2026-11-01", "--to", "2026-11-24"])
+        self.assertEqual(code, 0)
+        self.assertEqual(get.call_args.args[1], {
+            "range": "custom", "from": "2026-11-01", "to": "2026-11-24", "limit": 50})
 
     def test_fail_on_open_exit_code(self):
         with mock.patch.object(cli, "load_profile", return_value={"url": "http://x", "token": "t"}), \

@@ -54,7 +54,7 @@ Read-only tools are always available:
 | `skyfarer_incident` | One incident with updates, tickets and deliveries | `id` |
 | `skyfarer_history` | Availability and SLA report | `range`, `from`, `to`, `provider`, `region`, `format` (`csv` returns raw CSV) |
 | `skyfarer_deliveries` | Notification deliveries | `channel`, `status`, `limit`, `cursor` |
-| `skyfarer_poll_log` | Poll cycles | `range`, `limit`, `cursor` |
+| `skyfarer_poll_log` | Poll cycles | `range`, `from`, `to`, `limit`, `cursor` |
 
 With `--allow-writes`, seven admin tools are added:
 `skyfarer_set_provider`, `skyfarer_test_channel`, `skyfarer_add_webhook`,
