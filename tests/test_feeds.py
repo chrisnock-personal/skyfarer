@@ -1,9 +1,11 @@
 """Feed parsing for the Statuspage and Hetzner providers, and the
 region matching they share. Fixtures are trimmed from real payloads (November
-2026). Run with: python -m unittest discover tests"""
+2026); the scheduled Hetzner work uses a generated future date so the test
+keeps meaning as time passes. Run with: python -m unittest discover tests"""
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import feedparser
@@ -30,6 +32,11 @@ DO_INCIDENT = {
         {"status": "investigating", "body": "We are investigating."},
     ],
 }
+
+# Hetzner marks a notice as maintenance when its start is still ahead of us.
+# Keep that one fixture in the future so the rule is exercised, not just dated.
+FUTURE_START = (datetime.now(timezone.utc) + timedelta(days=30)).strftime(
+    "%Y-%m-%dT%H:%M:%S+00:00")
 
 CLOUDFLARE_MAINTENANCE = {
     "id": "m1", "name": "EWR (Newark) on 2026-11-18", "status": "scheduled",
@@ -83,11 +90,11 @@ HETZNER_ATOM = """<?xml version="1.0" encoding="utf-8"?>
     <title>Power work in HEL1-DC2</title>
     <category term="HEL1-DC2"/>
     <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">
-      <p>Start: 2026-11-20T06:00:00+00:00</p>
+      <p>Start: __FUTURE_START__</p>
       <p>Replacement of UPS components.</p>
     </div></content>
   </entry>
-</feed>"""
+</feed>""".replace("__FUTURE_START__", FUTURE_START)
 
 
 def _env(**values):
