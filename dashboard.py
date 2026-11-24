@@ -464,7 +464,8 @@ def history_page():
          ORDER BY detected_at DESC LIMIT 5000
     """, (end, start))
 
-    watched = feeds.watched_regions()
+    # Include regions found through account keys, as the Providers cards do.
+    watched = feeds.watched_regions(_provider_resources())
     provider_names = list(dict.fromkeys(
         [*feeds.PROVIDER_NAMES, *watched, *(r["provider"] for r in rows)]))
     region_names = sorted({r.strip() for regions in watched.values() for r in regions}

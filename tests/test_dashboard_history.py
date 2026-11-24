@@ -40,6 +40,7 @@ class HistoryPage(unittest.TestCase):
                               return_value=(NOW - timedelta(days=30), NOW)),
             mock.patch.object(dashboard.db, "get_conn", side_effect=fake_conn),
             mock.patch.object(dashboard.settings, "load", return_value={}),
+            mock.patch.object(dashboard, "_provider_resources", return_value={}),
             mock.patch.object(dashboard.feeds, "watched_regions",
                               return_value={"DigitalOcean": ["LON1"], "Hetzner": ["FSN1"]}),
         ]
