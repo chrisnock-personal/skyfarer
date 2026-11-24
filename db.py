@@ -11,12 +11,14 @@ incident_updates  – later feed entries about an incident (AWS posts each
 notifications     – delivery queue: one row per notice per channel
 poll_log          – one row per poll cycle for observability
 settings, webhooks, users, settings_log – see settings.py
+dashboard_state, login_failures – shared first-run code and sign-in throttle
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -157,6 +159,23 @@ CREATE TABLE IF NOT EXISTS users (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_login      TIMESTAMPTZ
 );
+
+-- First-run setup code and sign-in throttling live here, not in a worker's
+-- memory, so gunicorn can run several workers (or replicas).
+CREATE TABLE IF NOT EXISTS dashboard_state (
+    key             TEXT PRIMARY KEY,
+    value           TEXT NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS login_failures (
+    id              BIGSERIAL PRIMARY KEY,
+    bucket          TEXT NOT NULL,             -- client address + email
+    failed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_failures_bucket ON login_failures (bucket, failed_at);
+CREATE INDEX IF NOT EXISTS idx_login_failures_time ON login_failures (failed_at);
 
 -- Who changed what. Secret values are never written here.
 CREATE TABLE IF NOT EXISTS settings_log (
@@ -391,3 +410,69 @@ def log_poll(conn, *, entries_seen: int, tickets_created: int,
             VALUES (%s, %s, %s, %s, %s, %s)
         """, (entries_seen, tickets_created, tickets_resolved, open_count,
               error, feed_errors))
+
+
+# ─── Dashboard state shared by every worker ─────────────────────────────────
+
+SETUP_CODE_KEY = "setup_code"
+
+
+def lock_setup(conn) -> None:
+    """Hold off other workers while the first admin is being created."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(77702)")
+
+
+def setup_code(conn) -> str:
+    """Return the one-time setup code, creating it once if it doesn't exist.
+
+    The caller logs it. Workers that start later can read the same value, so a
+    restart doesn't strand the setup page with a code nobody can find.
+    """
+    lock_setup(conn)
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM dashboard_state WHERE key = %s", (SETUP_CODE_KEY,))
+        existing = cur.fetchone()
+        if existing:
+            return existing[0]
+        code = "-".join(secrets.token_hex(3) for _ in range(3))
+        cur.execute("""
+            INSERT INTO dashboard_state (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO NOTHING RETURNING value
+        """, (SETUP_CODE_KEY, code))
+        inserted = cur.fetchone()
+        if inserted:
+            return inserted[0]
+        cur.execute("SELECT value FROM dashboard_state WHERE key = %s", (SETUP_CODE_KEY,))
+        return cur.fetchone()[0]
+
+
+def clear_setup_code(conn) -> None:
+    """The code is single-use: drop it once the first admin exists."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM dashboard_state WHERE key = %s", (SETUP_CODE_KEY,))
+
+
+def lock_login(conn, bucket: str) -> None:
+    """Serialise counting and recording failures for one sign-in attempt."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(77703, hashtext(%s))", (bucket,))
+
+
+def login_failures(conn, bucket: str, window: int) -> int:
+    """Wrong attempts for this address/email inside the last `window` seconds."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM login_failures WHERE failed_at < NOW() - %s * INTERVAL '1 second'",
+                    (window,))
+        cur.execute("SELECT COUNT(*) FROM login_failures WHERE bucket = %s", (bucket,))
+        return cur.fetchone()[0]
+
+
+def login_failed(conn, bucket: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO login_failures (bucket) VALUES (%s)", (bucket,))
+
+
+def login_succeeded(conn, bucket: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM login_failures WHERE bucket = %s", (bucket,))

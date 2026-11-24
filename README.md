@@ -145,7 +145,9 @@ Sessions last 12 hours. Behind an HTTPS proxy, set `DASHBOARD_HTTPS=true`: the
 session cookie is then only sent over HTTPS, and the dashboard takes the
 client's address, scheme and host from the proxy's `X-Forwarded-*` headers (for
 setup links and the sign-in throttle). Leave it unset without a proxy, so
-those headers aren't trusted. The dashboard runs under gunicorn.
+those headers aren't trusted. The setup code and the failed-attempt counts live
+in Postgres, so the dashboard can run under gunicorn with several workers or
+replicas.
 
 ![Users and access: the two roles, the people, and the change history](docs/images/users.png)
 
@@ -562,11 +564,11 @@ python poller.py --init-db
 python poller.py --once --dry-run   # test first
 python poller.py                     # continuous
 python dashboard.py                  # the dashboard, on :8080 (Flask's own server)
-gunicorn --workers 1 --threads 8 --bind 0.0.0.0:8080 wsgi:app   # as compose runs it
+gunicorn --workers 2 --threads 8 --bind 0.0.0.0:8080 wsgi:app   # as compose runs it
 ```
 
-Run the dashboard as one process (threads for concurrency): the first-run
-setup code and the sign-in throttle are held in its memory.
+The dashboard can use several workers (set `DASHBOARD_WORKERS` in compose) or
+replicas: the first-run setup code and the sign-in throttle are in Postgres.
 
 ## Modes
 

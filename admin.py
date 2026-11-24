@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import logging
 import secrets
-import time
-from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlsplit
@@ -34,8 +32,6 @@ bp = Blueprint("admin", __name__)
 OPEN_ENDPOINTS = {"admin.login", "admin.setup", "admin.welcome"}
 ALWAYS_OPEN = {"static", "healthz"}
 
-_setup_code: list[str] = []
-_failures: dict[str, deque] = defaultdict(deque)
 FAILURE_LIMIT = 5
 FAILURE_WINDOW = 15 * 60
 _bootstrapped: list[bool] = []
@@ -105,14 +101,6 @@ def _actor() -> str:
 
 # ─── Signing in ─────────────────────────────────────────────────────────────
 
-def _throttled(key: str) -> bool:
-    now = time.monotonic()
-    q = _failures[key]
-    while q and now - q[0] > FAILURE_WINDOW:
-        q.popleft()
-    return len(q) >= FAILURE_LIMIT
-
-
 @bp.route("/login", methods=["GET", "POST"])
 def login():
     if g.user:
@@ -121,18 +109,24 @@ def login():
     email = request.form.get("email", "").strip()
     nxt = _safe_next(request.values.get("next"))
     if request.method == "POST":
-        key = f"{request.remote_addr}|{email.lower()}"
-        if _throttled(key):
-            error = "Too many attempts. Wait 15 minutes, or ask an admin for a setup link."
-        else:
-            with db.get_conn() as conn:
+        user = None
+        bucket = f"{request.remote_addr}|{email.lower()}"
+        with db.get_conn() as conn:
+            # The lock and all three queries share this transaction, so the
+            # workers can't each allow their own five attempts.
+            db.lock_login(conn, bucket)
+            if db.login_failures(conn, bucket, FAILURE_WINDOW) >= FAILURE_LIMIT:
+                error = "Too many attempts. Wait 15 minutes, or ask an admin for a setup link."
+            else:
                 user = settings.check_login(conn, email, request.form.get("password", ""))
-            if user:
-                _failures.pop(key, None)
-                _sign_in(user["id"])
-                return redirect(nxt)
-            _failures[key].append(time.monotonic())
-            error = "That email and password don't match an account."
+                if user:
+                    db.login_succeeded(conn, bucket)
+                else:
+                    db.login_failed(conn, bucket)
+                    error = "That email and password don't match an account."
+        if user:
+            _sign_in(user["id"])
+            return redirect(nxt)
     return render_template("login.html", error=error, email=email, next=nxt)
 
 
@@ -142,13 +136,13 @@ def logout():
     return redirect(url_for("admin.login"))
 
 
-def _the_setup_code() -> str:
-    if not _setup_code:
-        code = "-".join(secrets.token_hex(3) for _ in range(3))
-        _setup_code.append(code)
-        log.warning("First run: no accounts yet. Open the dashboard and enter this "
-                    "setup code to create the first admin: %s", code)
-    return _setup_code[0]
+def _the_setup_code(conn) -> str:
+    code = db.setup_code(conn)
+    # Log on each visit, not just when the code is made: a worker (or the
+    # container) may have restarted since another one generated it.
+    log.warning("First run: no accounts yet. Open the dashboard and enter this "
+                "setup code to create the first admin: %s", code)
+    return code
 
 
 @bp.route("/setup", methods=["GET", "POST"])
@@ -157,28 +151,29 @@ def setup():
         if settings.user_count(conn):
             return redirect(url_for("admin.login"))
         summary = settings.imported_summary(conn)
-    code = _the_setup_code()
-    error = None
-    form = request.form
-    if request.method == "POST":
-        problem = settings.password_problem(form.get("password", ""))
-        if not secrets.compare_digest(form.get("code", "").strip().lower(), code):
-            error = "That isn't the setup code. It's in the dashboard's log."
-        elif not form.get("name", "").strip() or "@" not in form.get("email", ""):
-            error = "Enter your name and email."
-        elif problem:
-            error = problem
-        else:
-            with db.get_conn() as conn:
+        code = _the_setup_code(conn)
+        error = None
+        form = request.form
+        if request.method == "POST":
+            problem = settings.password_problem(form.get("password", ""))
+            if not secrets.compare_digest(form.get("code", "").strip().lower(), code):
+                error = "That isn't the setup code. It's in the dashboard's log."
+            elif not form.get("name", "").strip() or "@" not in form.get("email", ""):
+                error = "Enter your name and email."
+            elif problem:
+                error = problem
+            else:
+                # setup_code() took the advisory lock for this transaction, so
+                # no other worker can create the first admin while we do.
                 if settings.user_count(conn):
                     return redirect(url_for("admin.login"))
                 new = settings.create_user(conn, form["email"], form["name"], "admin",
                                            "Skyfarer", password=form["password"])
-            _setup_code.clear()
-            _sign_in(new.user_id)
-            flash("Your admin account is ready. These settings came from .env; "
-                  "from now on, change them here.", "ok")
-            return redirect(url_for("admin.providers"))
+                db.clear_setup_code(conn)
+                _sign_in(new.user_id)
+                flash("Your admin account is ready. These settings came from .env; "
+                      "from now on, change them here.", "ok")
+                return redirect(url_for("admin.providers"))
     return render_template("setup.html", error=error, summary=summary, form=form)
 
 
