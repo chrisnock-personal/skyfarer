@@ -285,7 +285,8 @@ def build_parser() -> argparse.ArgumentParser:
     rset.add_argument("--events", nargs="*")
     rset.add_argument("--max-age-hours", type=float)
     rset.add_argument("--retry-hours", type=float)
-    rset.add_argument("--maintenance", action="store_true")
+    rset.add_argument("--maintenance", action=argparse.BooleanOptionalAction, default=None,
+                      help="Alert on planned maintenance (--no-maintenance to stop)")
 
     boot = sub.add_parser("bootstrap", help="Create the first admin on a fresh instance")
     boot.add_argument("--name", default=os.getenv("SKYFARER_BOOTSTRAP_ADMIN_NAME", ""))
@@ -330,7 +331,7 @@ def run(args: argparse.Namespace) -> int:
     client = Client(url, token)
 
     if args.command == "status":
-        output(client.get("/status"), args.json, ["provider", "state", "last_poll"])
+        output(client.get("/status"), args.json, ["label", "status", "regions"])
     elif args.command == "incidents":
         if args.action == "list":
             params = {"state": args.state, "provider": args.provider or "all",
@@ -338,7 +339,7 @@ def run(args: argparse.Namespace) -> int:
                       "from": args.date_from, "to": args.date_to, "limit": args.limit}
             result = client.get("/incidents", params)
             output(result, args.json, ["id", "detected_at", "provider", "region", "state", "title"])
-            if not args.json and result.get("items") and args.fail_on_open:
+            if args.fail_on_open and result.get("items"):
                 return EXIT_OPEN_INCIDENT
         else:
             output(client.get(f"/incidents/{args.id}"), args.json,
@@ -359,7 +360,8 @@ def run(args: argparse.Namespace) -> int:
                ["id", "created_at", "channel", "status", "incident_title"])
     elif args.command == "poll-log":
         output(client.get("/poll-log", {"range": args.range, "limit": args.limit}), args.json,
-               ["id", "polled_at", "channel", "status"])
+               ["id", "polled_at", "entries_seen", "tickets_created", "tickets_resolved",
+                "open_count", "error"])
     elif args.command == "providers":
         if args.action == "list":
             output(client.get("/providers"), args.json, ["name", "label", "enabled", "regions"])
@@ -456,8 +458,8 @@ def run(args: argparse.Namespace) -> int:
             payload["max_age_hours"] = args.max_age_hours
         if args.retry_hours is not None:
             payload["retry_hours"] = args.retry_hours
-        if args.maintenance:
-            payload["maintenance"] = True
+        if args.maintenance is not None:
+            payload["maintenance"] = args.maintenance
         output(client.put("/rules", payload), args.json, ["changed"])
     return EXIT_OK
 

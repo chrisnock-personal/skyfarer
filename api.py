@@ -362,6 +362,10 @@ def _clean_settings(data: dict) -> tuple[dict, list[str]]:
             continue
         if value is None:
             proposed[key] = None
+        elif f.kind == "secret":
+            # As on /channels: blank leaves a stored secret alone; null clears it.
+            if str(value).strip():
+                proposed[key] = str(value).strip()
         elif f.kind == "bool":
             proposed[key] = "true" if as_bool(value) else "false"
         elif f.kind in ("list", "events"):
@@ -496,7 +500,10 @@ def put_settings():
     data = body()
     if isinstance(data, Response):
         return data
-    proposed, errors = _clean_settings(data.get("values", data))
+    values = data.get("values", data)
+    if not isinstance(values, dict):
+        return api_errors.problem(400, "values must be a JSON object.", code="bad-body")
+    proposed, errors = _clean_settings(values)
     if errors:
         return _problem_for(errors)
     with db.get_conn() as conn:
@@ -685,12 +692,15 @@ def put_rules():
     data = body()
     if isinstance(data, Response):
         return data
+    # Only what the caller sends changes: a missing field keeps its setting.
     proposed, errors = {}, []
-    events = data.get("events", [])
-    if not isinstance(events, list):
-        events = settings.split_list(str(events))
-    proposed["NOTIFY_EVENTS"] = ",".join(e for e in notifiers.EVENTS if e in events)
-    proposed["NOTIFY_MAINTENANCE"] = "true" if as_bool(data.get("maintenance", False)) else "false"
+    if "events" in data:
+        events = data["events"]
+        if not isinstance(events, list):
+            events = settings.split_list(str(events))
+        proposed["NOTIFY_EVENTS"] = ",".join(e for e in notifiers.EVENTS if e in events)
+    if "maintenance" in data:
+        proposed["NOTIFY_MAINTENANCE"] = "true" if as_bool(data["maintenance"]) else "false"
     for key, field in (("NOTIFY_MAX_AGE_HOURS", "max_age_hours"),
                        ("NOTIFY_RETRY_HOURS", "retry_hours")):
         if field not in data:

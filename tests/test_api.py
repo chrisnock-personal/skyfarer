@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -307,6 +308,17 @@ class ApiAdmin(unittest.TestCase):
         self.assertEqual(changes["NOTIFY_MAINTENANCE"], "true")
         self.assertIsNone(changes["ZENDESK_API_TOKEN"])
 
+    def test_put_settings_blank_secret_keeps_it(self):
+        response = self.client.put("/api/v1/settings", headers=self.headers, json={
+            "values": {"ZENDESK_API_TOKEN": "", "POLL_INTERVAL_SECONDS": "60"}})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("ZENDESK_API_TOKEN", admin.settings.save.call_args.args[1])
+
+    def test_put_settings_needs_an_object(self):
+        response = self.client.put("/api/v1/settings", headers=self.headers,
+                                   json={"values": ["POLL_INTERVAL_SECONDS"]})
+        self.assertEqual(response.status_code, 400)
+
     def test_put_settings_rejects_bad_select(self):
         response = self.client.put("/api/v1/settings", headers=self.headers, json={
             "values": {"POLL_INTERVAL_SECONDS": "7"}})
@@ -342,6 +354,12 @@ class ApiAdmin(unittest.TestCase):
         response = self.client.put("/api/v1/rules", headers=self.headers, json={
             "events": ["opened"], "max_age_hours": -4})
         self.assertEqual(response.status_code, 400)
+
+    def test_rules_change_only_what_is_sent(self):
+        response = self.client.put("/api/v1/rules", headers=self.headers,
+                                   json={"retry_hours": 2})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(admin.settings.save.call_args.args[1], {"NOTIFY_RETRY_HOURS": "2"})
 
     def test_webhook_crud(self):
         created = self.client.post("/api/v1/webhooks", headers=self.headers, json={
@@ -410,9 +428,35 @@ class CliClient(unittest.TestCase):
                                                                    "next_cursor": None}):
             code = cli.main(["incidents", "list", "--fail-on-open"])
         self.assertEqual(code, 7)
+        with mock.patch.object(cli, "load_profile", return_value={"url": "http://x", "token": "t"}), \
+                mock.patch.object(cli.Client, "get", return_value={"items": [{"id": 1}],
+                                                                   "next_cursor": None}), \
+                mock.patch("sys.stdout", io.StringIO()):
+            code = cli.main(["--json", "incidents", "list", "--fail-on-open"])
+        self.assertEqual(code, 7)
+
+    def test_status_table_shows_the_providers(self):
+        out = io.StringIO()
+        status = {"summary": {}, "providers": [{"name": "OVH", "label": "OVHcloud",
+                                                "status": "Operational", "regions": "GRA"}]}
+        with mock.patch.object(cli, "load_profile", return_value={"url": "http://x", "token": "t"}), \
+                mock.patch.object(cli.Client, "get", return_value=status), \
+                mock.patch("sys.stdout", out):
+            cli.main(["status"])
+        self.assertIn("OVHcloud", out.getvalue())
+        self.assertIn("Operational", out.getvalue())
+
+    def test_rules_can_turn_maintenance_off(self):
+        with mock.patch.object(cli, "load_profile", return_value={"url": "http://x", "token": "t"}), \
+                mock.patch.object(cli.Client, "put", return_value={"changed": []}) as put, \
+                mock.patch("sys.stdout", io.StringIO()):
+            cli.main(["rules", "set", "--no-maintenance"])
+            self.assertEqual(put.call_args.args[1], {"maintenance": False})
+            cli.main(["rules", "set", "--retry-hours", "2"])
+            self.assertEqual(put.call_args.args[1], {"retry_hours": 2.0})
 
     def test_history_csv_is_written(self):
-        path = os.path.join("/tmp", "opencode", "cli-test.csv")
+        path = os.path.join(tempfile.mkdtemp(), "cli-test.csv")
         with mock.patch.object(cli, "load_profile", return_value={"url": "http://x", "token": "t"}), \
                 mock.patch.object(cli.Client, "get", return_value="Started (UTC),Provider\n"):
             code = cli.main(["history", "--csv", path])

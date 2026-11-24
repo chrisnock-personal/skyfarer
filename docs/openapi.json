@@ -202,7 +202,7 @@
                "responses": {"200": {"description": "ok and message"}}}
     },
     "/rules": {
-      "put": {"tags": ["admin"], "summary": "Set the alert rules",
+      "put": {"tags": ["admin"], "summary": "Set the alert rules (fields left out keep their setting)",
               "responses": {"200": {"description": "Change history lines"}}}
     },
     "/webhooks": {

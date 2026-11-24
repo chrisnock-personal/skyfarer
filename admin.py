@@ -54,7 +54,12 @@ def _ensure_bootstrapped(conn) -> None:
     if _bootstrapped:
         return
     settings.bootstrap()
-    settings.headless_bootstrap(conn)
+    try:
+        settings.headless_bootstrap(conn)
+    except ValueError as exc:
+        # A weak SKYFARER_BOOTSTRAP_ADMIN_PASSWORD mustn't take the whole
+        # dashboard down: say why, and leave the setup page to do it instead.
+        log.error("SKYFARER_BOOTSTRAP_ADMIN_PASSWORD wasn't used: %s", exc)
     _bootstrapped.append(True)
 
 
