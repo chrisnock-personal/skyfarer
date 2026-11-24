@@ -84,7 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_incident_updates_incident ON incident_updates (in
 CREATE TABLE IF NOT EXISTS notifications (
     id              SERIAL PRIMARY KEY,
     incident_id     INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
-    channel         TEXT NOT NULL,             -- zendesk | servicenow | pushover | pagerduty | teams | snmp | webhook
+    channel         TEXT NOT NULL,             -- any notifiers.SENDERS key, or webhook-<id>
     event           TEXT NOT NULL,             -- opened | updated | resolved
     payload         JSONB NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | failed

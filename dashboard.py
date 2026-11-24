@@ -60,7 +60,7 @@ STATE_LABELS = [("open", "Active"), ("resolved", "Resolved"), ("all", "All")]
 PROVIDER_LABELS = {"GCP": "Google Cloud", "OVH": "OVHcloud"}
 CHANNEL_LABELS = {
     "zendesk": "Zendesk", "servicenow": "ServiceNow", "jsm": "Jira Service Management",
-    "freshdesk": "Freshdesk",
+    "freshdesk": "Freshdesk", "freshservice": "Freshservice",
     "pushover": "Pushover", "pagerduty": "PagerDuty",
     "teams": "Microsoft Teams", "snmp": "SNMP traps", "webhook": "Webhook",
 }
@@ -348,6 +348,9 @@ def _tickets(row) -> list[dict]:
         if t["system"] == "freshdesk":
             tickets.append({"label": t["number"] or f"#{t['ref']}",
                             "url": f"{notifiers.FRESHDESK_URL}/a/tickets/{t['ref']}" if notifiers.FRESHDESK_URL else None})
+        if t["system"] == "freshservice":
+            tickets.append({"label": t["number"] or f"#{t['ref']}",
+                            "url": f"{notifiers.FRESHSERVICE_URL}/a/tickets/{t['ref']}" if notifiers.FRESHSERVICE_URL else None})
         if t["system"] == "jsm":
             tickets.append({"label": t["number"] or t["ref"],
                             "url": f"{notifiers.JSM_URL}/browse/{t['ref']}" if notifiers.JSM_URL else None})
