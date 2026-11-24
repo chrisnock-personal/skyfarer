@@ -24,11 +24,16 @@ def api_response(body, status=200):
 
 class Discovery(unittest.TestCase):
     def test_digitalocean_counts_every_page(self):
+        # DigitalOcean's own shape: links.pages.next until the last page.
         pages = [
             {"droplets": [{"region": {"slug": "lon1"}}, {"region": {"slug": "ams3"}}],
-             "meta": {"pagination": {"pages": 2}}},
+             "links": {"pages": {"next": "https://api.digitalocean.com/v2/droplets?page=2",
+                                 "last": "https://api.digitalocean.com/v2/droplets?page=2"}},
+             "meta": {"total": 3}},
             {"droplets": [{"region": {"slug": "LON1"}}],
-             "meta": {"pagination": {"pages": 2}}},
+             "links": {"pages": {"first": "https://api.digitalocean.com/v2/droplets?page=1",
+                                 "prev": "https://api.digitalocean.com/v2/droplets?page=1"}},
+             "meta": {"total": 3}},
         ]
         calls = []
 
@@ -84,6 +89,22 @@ class Discovery(unittest.TestCase):
         self.assertEqual(cleared, {"Linode"})
         self.assertEqual(providers.DISCOVERED, regions)
         self.assertEqual(providers.ERRORS, errors)
+
+
+    def test_a_restart_with_a_failing_api_keeps_the_stored_regions(self):
+        old_regions, old_errors = providers.DISCOVERED, providers.ERRORS
+        self.addCleanup(setattr, providers, "DISCOVERED", old_regions)
+        self.addCleanup(setattr, providers, "ERRORS", old_errors)
+        providers.DISCOVERED = {}
+        providers.seed({"Hetzner": {"FSN1": 2}})
+        with mock.patch.dict(os.environ, {"HETZNER_API_KEY": "key"}), \
+             mock.patch.object(providers, "_discover_hetzner",
+                               side_effect=RuntimeError("HTTP 503")):
+            os.environ.pop("DIGITALOCEAN_API_KEY", None)
+            os.environ.pop("LINODE_API_KEY", None)
+            regions, errors, _ = providers.discover()
+        self.assertEqual(regions, {"Hetzner": {"FSN1": 2}})
+        self.assertEqual(errors, {"Hetzner": "HTTP 503"})
 
 
 class Impact(unittest.TestCase):

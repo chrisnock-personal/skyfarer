@@ -71,8 +71,8 @@ def _discover_digitalocean(token: str) -> dict[str, int]:
             slug = (droplet.get("region") or {}).get("slug") if isinstance(droplet, dict) else ""
             if slug:
                 counts[str(slug).upper()] += 1
-        pagination = (data.get("meta") or {}).get("pagination") or {}
-        if page >= int(pagination.get("pages") or 1):
+        # DigitalOcean pages with links.pages.next; meta only carries a total.
+        if not ((data.get("links") or {}).get("pages") or {}).get("next"):
             break
     return dict(counts)
 
@@ -121,6 +121,14 @@ API_KEYS: dict[str, tuple[str, str, str]] = {
     "Hetzner": ("HETZNER_API_KEY", "HETZNER_ENABLED", "_discover_hetzner"),
     "Linode": ("LINODE_API_KEY", "LINODE_ENABLED", "_discover_linode"),
 }
+
+
+def seed(snapshot: dict[str, dict[str, int]]) -> None:
+    """Start from the last good read kept in Postgres, so that after a restart
+    a provider whose API is failing still has its regions watched."""
+    global DISCOVERED
+    if not DISCOVERED:
+        DISCOVERED = {name: dict(counts) for name, counts in snapshot.items()}
 
 
 def discover() -> tuple[dict[str, dict[str, int]], dict[str, str], set[str]]:

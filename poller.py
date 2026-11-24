@@ -294,9 +294,26 @@ def fetch_all(errors: feeds.FeedErrors):
     return entries, azure_listed, hetzner_listed
 
 
+_seeded: list[bool] = []
+
+
+def _seed_discovery() -> None:
+    """Once per process, load the last good account read from Postgres, so a
+    provider API that is down when the poller restarts keeps its regions."""
+    if _seeded:
+        return
+    try:
+        with db.get_conn() as conn:
+            providers.seed(db.provider_resources(conn))
+        _seeded.append(True)
+    except Exception as exc:  # the poll cycle reports database trouble itself
+        log.warning("Couldn't load the last account read: %s", exc)
+
+
 def poll_once(dry_run: bool = False) -> tuple[int, int]:
     """Run one poll cycle. Returns (incidents_created, incidents_resolved)."""
     errors = feeds.FeedErrors()
+    _seed_discovery()
     discovered, api_errors, cleared = providers.discover()
     for name, reason in api_errors.items():
         errors.add(f"{name} API", reason)
