@@ -170,6 +170,12 @@ printed by default; `--json` gives stable output for scripts. Exit codes are 0
 (ok), 2 (usage/connection), 3 (auth), 4 (permission), 5 (not found), 6
 (conflict), 7 (open incident found) and 8 (rate limited or a test failed).
 
+Agents can use `skyfarer-mcp`, an MCP server over stdio built on the same
+client. It exposes read-only status, incident, history, delivery and poll-log
+tools by default; `--allow-writes` adds the admin tools. It reads the same
+`SKYFARER_URL` / `SKYFARER_TOKEN` and profile as the CLI. See
+[docs/mcp.md](docs/mcp.md) for client configuration and the tool list.
+
 For an unattended first install, set `SKYFARER_BOOTSTRAP_ADMIN_NAME`,
 `SKYFARER_BOOTSTRAP_ADMIN_EMAIL` and either
 `SKYFARER_BOOTSTRAP_ADMIN_PASSWORD` (the admin can sign in immediately) or

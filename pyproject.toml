@@ -11,6 +11,7 @@ dependencies = []
 
 [project.scripts]
 skyfarer = "cli:main"
+skyfarer-mcp = "skyfarer_mcp:main"
 
 [tool.setuptools]
-py-modules = ["cli"]
+py-modules = ["cli", "skyfarer_mcp"]
