@@ -5,6 +5,8 @@
   </picture>
 </p>
 
+[![Tests](https://github.com/chrisnock-personal/skyfarer/actions/workflows/tests.yml/badge.svg)](https://github.com/chrisnock-personal/skyfarer/actions/workflows/tests.yml)
+
 **Skyfarer** keeps watch over the clouds you run on. It polls the public status
 pages of AWS, Azure, Google Cloud, OVHcloud, DigitalOcean, Hetzner, Linode,
 Cloudflare and Scaleway for incidents and maintenance in the regions you care
@@ -750,7 +752,8 @@ switches, secret encryption, the change history's wording, updates on
 providers with a stable incident ID, and the History report's numbers, CSV and
 page rendering, plus API authentication, scopes, pagination, the OpenAPI
 document, the token settings page and the CLI. They need no database or
-network.
+network. CI runs them on Python 3.12 (the image's version) and 3.13, and builds
+the Docker image, on every push and pull request.
 
 ## .env reference
 
