@@ -355,6 +355,30 @@ class ApiAdmin(unittest.TestCase):
             "events": ["opened"], "max_age_hours": -4})
         self.assertEqual(response.status_code, 400)
 
+    def test_nonfinite_numbers_are_not_saved_as_settings(self):
+        for raw in ("nan", "inf", "-inf", "1e309"):
+            with self.subTest(raw=raw):
+                response = self.client.put("/api/v1/settings", headers=self.headers, json={
+                    "values": {"NOTIFY_MAX_AGE_HOURS": raw}})
+                self.assertEqual(response.status_code, 400)
+        admin.settings.save.assert_not_called()
+
+    def test_nonfinite_channel_numbers_are_rejected(self):
+        channel = mock.Mock(fields=[settings.Field("AMOUNT", "Amount", "number")])
+        for raw in ("nan", "inf", "-inf", "1e309"):
+            with self.subTest(raw=raw):
+                proposed, errors = api._clean_channel(channel, {"AMOUNT": raw})
+                self.assertEqual(errors, ["Amount must be a non-negative number."])
+                self.assertNotIn("AMOUNT", proposed)
+
+    def test_rules_reject_nonfinite_hours(self):
+        for raw in ("nan", "inf", "-inf", "1e309"):
+            with self.subTest(raw=raw):
+                response = self.client.put("/api/v1/rules", headers=self.headers, json={
+                    "max_age_hours": raw})
+                self.assertEqual(response.status_code, 400)
+        admin.settings.save.assert_not_called()
+
     def test_rules_change_only_what_is_sent(self):
         response = self.client.put("/api/v1/rules", headers=self.headers,
                                    json={"retry_hours": 2})

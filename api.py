@@ -10,6 +10,7 @@ call the same helpers as the HTML pages, so the two views cannot drift apart.
 
 from __future__ import annotations
 
+import math
 import os
 import secrets
 from datetime import date, datetime
@@ -379,7 +380,7 @@ def _clean_settings(data: dict) -> tuple[dict, list[str]]:
         elif f.kind == "number":
             try:
                 number = float(value)
-                if number < 0:
+                if not math.isfinite(number) or number < 0:
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(f"{f.label} must be a non-negative number.")
@@ -415,7 +416,7 @@ def _clean_channel(c, data: dict) -> tuple[dict, list[str]]:
         elif f.kind == "number":
             try:
                 number = float(value)
-                if number < 0:
+                if not math.isfinite(number) or number < 0:
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(f"{f.label} must be a non-negative number.")
@@ -707,7 +708,7 @@ def put_rules():
             continue
         try:
             number = float(data[field])
-            if number < 0:
+            if not math.isfinite(number) or number < 0:
                 raise ValueError
         except (TypeError, ValueError):
             errors.append(f"{settings.FIELDS[key].label} must be a number of hours.")

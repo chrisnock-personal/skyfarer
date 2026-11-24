@@ -19,6 +19,7 @@ import hmac
 import html
 import json
 import logging
+import math
 import re
 import os
 from datetime import datetime, timedelta, timezone
@@ -206,9 +207,12 @@ def configure(webhooks: Optional[list[Webhook]] = None) -> None:
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(os.getenv(name, "") or default)
+        number = float(os.getenv(name, "") or default)
     except ValueError:
         return default
+    # float("nan") and float("inf") are legal Python but not usable hours:
+    # they break the poller's timedelta math on the next cycle.
+    return number if math.isfinite(number) else default
 
 
 configure()
