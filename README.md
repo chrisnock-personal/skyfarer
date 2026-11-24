@@ -8,8 +8,8 @@
 **Skyfarer** keeps watch over the clouds you run on. It polls the public status
 pages of AWS, Azure, Google Cloud, OVHcloud, DigitalOcean, Hetzner, Linode,
 Cloudflare and Scaleway for incidents and maintenance in the regions you care
-about. It raises Zendesk, ServiceNow, Jira Service Management or Freshdesk
-tickets and sends Pushover, PagerDuty, Microsoft Teams, SNMP trap and webhook
+about. It raises Zendesk, ServiceNow, Jira Service Management, Freshdesk or
+Freshservice tickets and sends Pushover, PagerDuty, Microsoft Teams, SNMP trap and webhook
 notifications, keeps the tickets up to date as the provider posts, then
 follows up when the provider marks the incident clear. With an optional
 read-only key on DigitalOcean, Hetzner or Linode, it also discovers which
@@ -85,7 +85,7 @@ light, and the browser remembers the choice. It shows:
   then upcoming work (soonest first). Filter by state (Active / Resolved /
   All) and provider, with the number of your account's resources in the
   affected regions where an account key is set; ticket numbers link to the
-  ticket in Zendesk, ServiceNow, Jira or Freshdesk
+  ticket in Zendesk, ServiceNow, Jira, Freshdesk or Freshservice
 - The last 50 notifications, with their status, attempts and any error
 - The last 50 rows of `poll_log`, with errors called out
 - Full-text search across incident title, summary, region, provider, and
@@ -114,10 +114,10 @@ dashboard:
   way as channel keys.
 - **Channels.** The alert rules (which events, how old is too old, how long to
   retry, maintenance), then Zendesk, ServiceNow, Jira Service Management,
-  Freshdesk, Pushover, PagerDuty, Teams and SNMP, each with its own switch,
-  editor and test button. A test uses the saved settings: a ServiceNow, Jira or
-  Freshdesk test creates a ticket and resolves it, a Zendesk test opens a
-  ticket and sets it to pending.
+  Freshdesk, Freshservice, Pushover, PagerDuty, Teams and SNMP, each with its
+  own switch, editor and test button. A test uses the saved settings: a
+  ServiceNow, Jira, Freshdesk or Freshservice test creates a ticket and resolves
+  it, a Zendesk test opens a ticket and sets it to pending.
 - **Webhooks.** Any number, each with its own URL, method, events, template,
   headers and signing secret.
 - **Users and access.** Admins see and change everything; viewers see the
@@ -154,7 +154,9 @@ Sessions last 12 hours. Behind an HTTPS proxy, set `DASHBOARD_HTTPS=true`: the
 session cookie is then only sent over HTTPS, and the dashboard takes the
 client's address, scheme and host from the proxy's `X-Forwarded-*` headers (for
 setup links and the sign-in throttle). Leave it unset without a proxy, so
-those headers aren't trusted. The dashboard runs under gunicorn.
+those headers aren't trusted. The setup code and the failed-attempt counts live
+in Postgres, so the dashboard can run under gunicorn with several workers or
+replicas.
 
 ![Users and access: the two roles, the people, and the change history](docs/images/users.png)
 
@@ -223,8 +225,8 @@ Records in ticketing systems other than Zendesk, whose ticket number is
 | Column | Type | Notes |
 |--------|------|-------|
 | incident_id | integer | FK to `incidents.id` |
-| system | text | `servicenow`, `jsm` or `freshdesk` |
-| ref | text | the system's own ID (a ServiceNow `sys_id`, a Jira key, a Freshdesk ticket ID) |
+| system | text | `servicenow`, `jsm`, `freshdesk` or `freshservice` |
+| ref | text | the system's own ID (a ServiceNow `sys_id`, a Jira key, a Freshdesk or Freshservice ticket ID) |
 | number | text | what people call it (`INC0010001`, `ITSM-12`, `#42`) |
 | created_at | timestamptz | when it was created |
 
@@ -283,7 +285,8 @@ One row per poll cycle -useful for spotting gaps or failures.
 
 ```
 Feed entry appears         → row inserted (state=open), notices queued,
-                             Zendesk / ServiceNow / Jira / Freshdesk ticket
+                             Zendesk / ServiceNow / Jira / Freshdesk /
+                             Freshservice ticket
 Provider posts an update   → stored with the incident, row shows it,
                              "updated" notices queued: a ticket note (and an
                              alert, if NOTIFY_EVENTS includes updated)
@@ -291,7 +294,7 @@ Resolved status found      → row → resolved, notices queued,
                              Zendesk note + ticket → pending,
                              ServiceNow work note + record → Resolved,
                              Jira comment + Resolve transition,
-                             Freshdesk note + status → Resolved
+                             Freshdesk, Freshservice note + status → Resolved
 Operator reviews & closes  → manual step in Zendesk; ServiceNow auto-closes
 ```
 
@@ -356,10 +359,10 @@ that name no watched region are logged, as are entries with no parseable date.
 
 ## Notifications
 
-Eight channels plus any number of webhooks, each set up under Settings >
+Nine channels plus any number of webhooks, each set up under Settings >
 Channels (or in `.env` before the first start). Any can run alone. Zendesk,
-ServiceNow, Jira Service Management and Freshdesk are the ticketing channels;
-the rest alert people and systems. The
+ServiceNow, Jira Service Management, Freshdesk and Freshservice are the
+ticketing channels; the rest alert people and systems. The
 settings column gives each setting's name in `.env` and in the database.
 
 | Channel | What it sends | Settings |
@@ -368,6 +371,7 @@ settings column gives each setting's name in `.env` and in the database.
 | ServiceNow | A record in the `incident` table through the Table API, work notes for updates, Resolved (with a close code) when the incident ends | `SERVICENOW_*` |
 | Jira Service Management | A request in a service desk through its REST API, internal comments for updates, resolved through a workflow transition when the incident ends | `JSM_*` |
 | Freshdesk | A ticket from a requester email you choose, private notes for updates, status Resolved (or Closed) when the incident ends | `FRESHDESK_*` |
+| Freshservice | A ticket from a requester email you choose, private notes for updates, status Resolved (or Closed) when the incident ends | `FRESHSERVICE_*` |
 | Pushover | A push message per event, with a link to the status page | `PUSHOVER_TOKEN`, `PUSHOVER_USER`, `PUSHOVER_PRIORITY` |
 | PagerDuty | An Events API v2 alert, resolved automatically when the incident ends | `PAGERDUTY_ROUTING_KEY`, `PAGERDUTY_SEVERITY` |
 | Microsoft Teams | An Adaptive Card, posted to a Workflows webhook | `TEAMS_WEBHOOK_URL` |
@@ -436,6 +440,17 @@ and sets the status to Resolved, or Closed with `FRESHDESK_RESOLVED_STATUS=5`.
 If your helpdesk requires fields before a ticket can be resolved, Freshdesk's
 refusal names them, and the test button shows it. So far only tested against a
 stand-in for the API.
+
+**Freshservice.** The same v2 API, at `*.freshservice.com`, with its own
+settings: `FRESHSERVICE_DOMAIN`, an agent's `FRESHSERVICE_API_KEY` and the
+requester `FRESHSERVICE_REQUESTER_EMAIL`. Priority, group, tags and other fields
+(`FRESHSERVICE_EXTRA_FIELDS`, such as `{"custom_fields": {"cf_service": "Cloud"}}`)
+are settings too. Updates are private notes; when the incident ends, Skyfarer
+adds a private note and sets the status to Resolved, or Closed with
+`FRESHSERVICE_RESOLVED_STATUS=5`. `FRESHSERVICE_RESOLVE=false` only adds the
+note. Freshservice's refusals name the fields at fault, which the test button
+shows. Like Freshdesk, so far tested against a stand-in rather than a real
+account.
 
 **Webhooks.** For anything else: a chat tool, an on-call service, an automation
 platform or your own system, as many as you need. Each sends its own requests,
@@ -596,11 +611,11 @@ python poller.py --init-db
 python poller.py --once --dry-run   # test first
 python poller.py                     # continuous
 python dashboard.py                  # the dashboard, on :8080 (Flask's own server)
-gunicorn --workers 1 --threads 8 --bind 0.0.0.0:8080 wsgi:app   # as compose runs it
+gunicorn --workers 2 --threads 8 --bind 0.0.0.0:8080 wsgi:app   # as compose runs it
 ```
 
-Run the dashboard as one process (threads for concurrency): the first-run
-setup code and the sign-in throttle are held in its memory.
+The dashboard can use several workers (set `DASHBOARD_WORKERS` in compose) or
+replicas: the first-run setup code and the sign-in throttle are in Postgres.
 
 ## Modes
 
