@@ -147,7 +147,7 @@ password, no sign-in) to own the token. Revoke a token from the same page; its
 Counters are in Postgres, so several dashboard workers share them.
 
 ```sh
-export SKYFARER_URL=http://192.168.1.195:8083
+export SKYFARER_URL=http://127.0.0.1:8080
 export SKYFARER_TOKEN=sk_live_…        # or put both in ~/.config/skyfarer/config.toml
 skyfarer status
 skyfarer incidents list --state open --json
@@ -169,6 +169,12 @@ tokens|settings|rules` subcommands and `deliveries`/`poll-log`. Use `--profile`,
 printed by default; `--json` gives stable output for scripts. Exit codes are 0
 (ok), 2 (usage/connection), 3 (auth), 4 (permission), 5 (not found), 6
 (conflict), 7 (open incident found) and 8 (rate limited or a test failed).
+
+Agents can use `skyfarer-mcp`, an MCP server over stdio built on the same
+client. It exposes read-only status, incident, history, delivery and poll-log
+tools by default; `--allow-writes` adds the admin tools. It reads the same
+`SKYFARER_URL` / `SKYFARER_TOKEN` and profile as the CLI. See
+[docs/mcp.md](docs/mcp.md) for client configuration and the tool list.
 
 For an unattended first install, set `SKYFARER_BOOTSTRAP_ADMIN_NAME`,
 `SKYFARER_BOOTSTRAP_ADMIN_EMAIL` and either
