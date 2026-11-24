@@ -462,7 +462,13 @@ def history_page():
 
     with db.get_conn() as conn:
         values = settings.load(conn)
-    targets = {name: history.target_value(values, name) for name in provider_names}
+    # Only providers in view count towards the overall availability and error
+    # budget: watched ones, and any with incidents in this window. A switched-off
+    # provider would otherwise add a perfect 100% and dilute real downtime.
+    in_view = [name for name in provider_names
+               if watched.get(name) or any(r["provider"] == name for r in rows)
+               or name == provider]
+    targets = {name: history.target_value(values, name) for name in in_view}
     report = history.build(rows, start, end, targets,
                            provider=provider, region=region, now=end)
 
