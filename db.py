@@ -11,6 +11,7 @@ incident_updates  – later feed entries about an incident (AWS posts each
 notifications     – delivery queue: one row per notice per channel
 poll_log          – one row per poll cycle for observability
 settings, webhooks, users, settings_log – see settings.py
+api_tokens         – hashed bearer tokens for the JSON API
 """
 
 from __future__ import annotations
@@ -158,6 +159,20 @@ CREATE TABLE IF NOT EXISTS users (
     last_login      TIMESTAMPTZ
 );
 
+-- Bearer tokens for the JSON API. The plaintext is shown once at creation;
+-- only its SHA-256 hash is kept. Scopes are a Postgres text array.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id            SERIAL PRIMARY KEY,
+    user_id       INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    token_hash    TEXT NOT NULL UNIQUE,
+    scopes        TEXT[] NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at  TIMESTAMPTZ,
+    revoked_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens (user_id);
+
 -- Who changed what. Secret values are never written here.
 CREATE TABLE IF NOT EXISTS settings_log (
     id              SERIAL PRIMARY KEY,
@@ -183,10 +198,15 @@ def get_conn():
 
 
 def init_schema():
-    """Create tables and indexes if they don't exist."""
+    """Create tables and indexes if they don't exist, and apply the small
+    column additions that older databases need."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
+            # Added for the API's service accounts; safe to run repeatedly.
+            cur.execute("""ALTER TABLE users ADD COLUMN IF NOT EXISTS kind
+                           TEXT NOT NULL DEFAULT 'human'
+                           CHECK (kind IN ('human', 'service'))""")
     log.info("Database schema initialised")
 
 

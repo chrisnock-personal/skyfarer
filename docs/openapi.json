@@ -1,0 +1,126 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Skyfarer API",
+    "version": "1.0.0",
+    "description": "Read-only JSON view of Skyfarer. Admin write endpoints are added in later phases. All list endpoints use cursor pagination."
+  },
+  "servers": [{"url": "/api/v1"}],
+  "security": [{"bearerAuth": []}],
+  "paths": {
+    "/openapi.json": {
+      "get": {
+        "summary": "This document (no token needed)",
+        "security": [],
+        "responses": {"200": {"description": "OpenAPI document"}}
+      }
+    },
+    "/status": {
+      "get": {
+        "summary": "Summary, providers, channel health and poll bars",
+        "responses": {
+          "200": {"description": "Current status"},
+          "401": {"$ref": "#/components/responses/Unauthorized"}
+        }
+      }
+    },
+    "/incidents": {
+      "get": {
+        "summary": "List incidents, newest detected first",
+        "parameters": [
+          {"name": "state", "in": "query", "schema": {"type": "string", "default": "open", "enum": ["all", "open", "resolved"]}},
+          {"name": "provider", "in": "query", "schema": {"type": "string", "default": "all"}},
+          {"name": "region", "in": "query", "schema": {"type": "string"}},
+          {"name": "q", "in": "query", "schema": {"type": "string"}},
+          {"name": "range", "in": "query", "schema": {"type": "string", "default": "all"}},
+          {"name": "from", "in": "query", "schema": {"type": "string", "format": "date"}},
+          {"name": "to", "in": "query", "schema": {"type": "string", "format": "date"}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50, "maximum": 200}},
+          {"name": "cursor", "in": "query", "schema": {"type": "integer"}}
+        ],
+        "responses": {
+          "200": {"description": "Page of incidents"},
+          "401": {"$ref": "#/components/responses/Unauthorized"}
+        }
+      }
+    },
+    "/incidents/{id}": {
+      "get": {
+        "summary": "One incident with updates, tickets and deliveries",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+        "responses": {"200": {"description": "Incident"}, "404": {"description": "Not found"}}
+      }
+    },
+    "/history": {
+      "get": {
+        "summary": "Availability and SLA report, as JSON or CSV",
+        "parameters": [
+          {"name": "range", "in": "query", "schema": {"type": "string", "default": "quarter", "enum": ["30d", "quarter", "year", "custom"]}},
+          {"name": "from", "in": "query", "schema": {"type": "string", "format": "date"}},
+          {"name": "to", "in": "query", "schema": {"type": "string", "format": "date"}},
+          {"name": "provider", "in": "query", "schema": {"type": "string", "default": "all"}},
+          {"name": "region", "in": "query", "schema": {"type": "string", "default": "all"}},
+          {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["csv"]}}
+        ],
+        "responses": {"200": {"description": "Report"}, "401": {"$ref": "#/components/responses/Unauthorized"}}
+      }
+    },
+    "/deliveries": {
+      "get": {
+        "summary": "Notification deliveries",
+        "parameters": [
+          {"name": "channel", "in": "query", "schema": {"type": "string"}},
+          {"name": "status", "in": "query", "schema": {"type": "string"}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
+          {"name": "cursor", "in": "query", "schema": {"type": "integer"}}
+        ],
+        "responses": {"200": {"description": "Page of deliveries"}}
+      }
+    },
+    "/poll-log": {
+      "get": {
+        "summary": "Poll cycles",
+        "parameters": [
+          {"name": "range", "in": "query", "schema": {"type": "string", "default": "all"}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
+          {"name": "cursor", "in": "query", "schema": {"type": "integer"}}
+        ],
+        "responses": {"200": {"description": "Page of poll cycles"}}
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Token from Settings > API tokens, shown once at creation and stored only as a hash."
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing, revoked or invalid token",
+        "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+      }
+    },
+    "schemas": {
+      "Problem": {
+        "type": "object",
+        "properties": {
+          "type": {"type": "string"},
+          "title": {"type": "string"},
+          "status": {"type": "integer"},
+          "detail": {"type": "string"},
+          "errors": {"type": "array", "items": {"type": "object"}}
+        }
+      },
+      "Page": {
+        "type": "object",
+        "properties": {
+          "items": {"type": "array", "items": {"type": "object"}},
+          "next_cursor": {"type": ["integer", "null"]}
+        }
+      }
+    }
+  }
+}

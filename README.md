@@ -115,6 +115,40 @@ Admins set the target per provider under **Settings > SLA targets**. The
 default is 99.90% and stored targets are recorded in the settings change
 history like any other setting. Nothing here changes polling or alerting.
 
+## API and CLI
+
+Skyfarer has a read-only JSON API at `/api/v1` for scripts, the CLI and agents.
+`GET /api/v1/openapi.json` serves the machine-readable contract; the endpoints
+are `status`, `incidents` (list and detail), `history`, `deliveries` and
+`poll-log`. Lists are cursor-paginated (50 by default, 200 maximum) and
+timestamps are ISO 8601. Errors are `application/problem+json` with a `detail`
+and, where useful, per-field `errors`.
+
+Every API request needs `Authorization: Bearer <token>`; cookie sessions are
+not accepted. Admins create tokens under **Settings > API tokens**, naming what
+they're for and choosing scopes such as `incidents:read` or `history:read`.
+A token is shown once and stored only as a SHA-256 hash. It acts as its user,
+so a viewer's token can never write anything even if given a write scope.
+For automation, create a *service account* (no password, no sign-in) to own the
+token. Revoke a token from the same page; its `last_used_at` is recorded.
+
+```sh
+export SKYFARER_URL=http://192.168.1.195:8083
+export SKYFARER_TOKEN=sk_live_…        # or put both in ~/.config/skyfarer/config.toml
+skyfarer status
+skyfarer incidents list --state open --json
+skyfarer history --range quarter --csv report.csv
+skyfarer incidents list --fail-on-open  # exit 7 while anything is open
+```
+
+The `skyfarer` command is installed in the container image, or with
+`pipx install .` from the repo. Use `--profile`, `--url` and `--token` to
+override the config file. Tables are printed by default; `--json` gives stable
+output for scripts. Exit codes are 0 (ok), 2 (usage/connection), 3 (auth),
+4 (permission), 5 (not found), 6 (conflict), 7 (open incident found) and
+8 (rate limited or partial failure). Admin write endpoints are planned; see
+the design on [issue #7](https://github.com/chrisnock-personal/skyfarer/issues/7).
+
 ## Settings and accounts
 
 Only three things stay in `.env`: `SKYFARER_SECRET_KEY`, the Postgres
@@ -135,6 +169,8 @@ dashboard:
   headers and signing secret.
 - **SLA targets.** Per-provider availability percentages for History & SLA,
   defaulting to 99.90%.
+- **API tokens.** Named bearer tokens with per-resource scopes, plus service
+  accounts to own them. Shown once, stored only as a hash.
 - **Users and access.** Admins see and change everything; viewers see the
   dashboard and nothing under Settings. There's always at least one admin, and
   nobody can change their own role.
@@ -265,6 +301,14 @@ The dashboard's settings (keyed by their `.env` names, secrets encrypted, plus
 `SLA_TARGET_*` for the History report), the webhooks, the accounts (password
 hashes, and setup links as SHA-256 hashes) and the change history. See
 [Settings and accounts](#settings-and-accounts).
+
+### `api_tokens`
+
+Named bearer tokens, one row per token. `token_hash` is the SHA-256 of the
+plaintext shown once at creation; `scopes` is a text array, always capped by
+the owning user's role. `last_used_at` and `revoked_at` make tokens auditable
+and revocable. Service accounts are ordinary users with `kind = 'service'` and
+no password. See [API and CLI](#api-and-cli).
 
 ### `poll_log`
 
@@ -614,7 +658,9 @@ plus region matching and parsing for the Statuspage and Hetzner feeds (from
 trimmed copies of real payloads), and how stored settings reach the poller,
 switches, secret encryption, the change history's wording, updates on
 providers with a stable incident ID, and the History report's numbers, CSV and
-page rendering. They need no database or network.
+page rendering, plus API authentication, scopes, pagination, the OpenAPI
+document, the token settings page and the CLI. They need no database or
+network.
 
 ## .env reference
 

@@ -619,13 +619,14 @@ def user_count(conn) -> int:
 
 
 def users(conn) -> list[dict]:
-    return _rows(conn, """SELECT id, email, name, role, last_login, setup_expires,
-                                 password_hash IS NOT NULL AS active
+    return _rows(conn, """SELECT id, email, name, role, kind, last_login, setup_expires,
+                                 kind = 'service' AS service,
+                                  password_hash IS NOT NULL AS active
                             FROM users ORDER BY role, name""")
 
 
 def user(conn, user_id: int) -> Optional[dict]:
-    rows = _rows(conn, "SELECT id, email, name, role FROM users WHERE id = %s", (user_id,))
+    rows = _rows(conn, "SELECT id, email, name, role, kind FROM users WHERE id = %s", (user_id,))
     return rows[0] if rows else None
 
 
@@ -642,19 +643,19 @@ def password_problem(password: str, confirm: Optional[str] = None) -> Optional[s
 
 
 def create_user(conn, email: str, name: str, role: str, actor: str,
-                password: Optional[str] = None) -> NewLink:
+                password: Optional[str] = None, kind: str = "human") -> NewLink:
     """Create an account. Without a password, it gets a setup link instead,
     returned once and stored only as a hash."""
     from werkzeug.security import generate_password_hash
     if role not in ROLES:
         raise ValueError(role)
-    token = None if password else secrets.token_urlsafe(32)
+    token = None if password or kind == "service" else secrets.token_urlsafe(32)
     with conn.cursor() as cur:
         # With a password, it's the first admin, signed in as the account is made.
-        cur.execute("""INSERT INTO users (email, name, role, password_hash, setup_token,
+        cur.execute("""INSERT INTO users (email, name, role, kind, password_hash, setup_token,
                                           setup_expires, last_login)
-                       VALUES (lower(%s), %s, %s, %s, %s, %s, %s) RETURNING id""",
-                    (email.strip(), name.strip(), role,
+                       VALUES (lower(%s), %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                    (email.strip(), name.strip(), role, kind,
                      generate_password_hash(password) if password else None,
                      _token_hash(token) if token else None,
                      datetime.now(timezone.utc) + timedelta(hours=SETUP_LINK_HOURS) if token else None,
@@ -681,6 +682,57 @@ def user_by_token(conn, token: str) -> Optional[dict]:
     rows = _rows(conn, """SELECT id, email, name, role FROM users
                            WHERE setup_token = %s AND setup_expires > NOW()""", (_token_hash(token),))
     return rows[0] if rows else None
+
+
+# ─── API tokens ──────────────────────────────────────────────────────────────
+
+API_TOKEN_PREFIX = "sk_live_"
+
+
+def create_api_token(conn, user_id: int, name: str, scopes: list[str],
+                     actor: str) -> tuple[int, str]:
+    """Create a bearer token. Only its hash is stored; the plaintext is
+    returned once for the caller to show."""
+    plaintext = API_TOKEN_PREFIX + secrets.token_urlsafe(32)
+    with conn.cursor() as cur:
+        cur.execute("""INSERT INTO api_tokens (user_id, name, token_hash, scopes)
+                       VALUES (%s, %s, %s, %s) RETURNING id""",
+                    (user_id, name.strip(), _token_hash(plaintext), list(scopes)))
+        token_id = cur.fetchone()[0]
+    history_add(conn, actor, f"Created API token {name.strip()}")
+    return token_id, plaintext
+
+
+def api_tokens(conn) -> list[dict]:
+    return _rows(conn, """SELECT t.id, t.user_id, t.name, t.scopes, t.created_at,
+                                 t.last_used_at, t.revoked_at IS NOT NULL AS revoked,
+                                 u.email AS user_email
+                            FROM api_tokens t JOIN users u ON u.id = t.user_id
+                           ORDER BY t.created_at DESC, t.id DESC""")
+
+
+def api_token(conn, plaintext: str) -> Optional[dict]:
+    """Look up a live token and the user it belongs to."""
+    rows = _rows(conn, """SELECT t.id AS token_id, t.scopes, u.id, u.email, u.name,
+                                 u.role, u.kind
+                            FROM api_tokens t JOIN users u ON u.id = t.user_id
+                           WHERE t.token_hash = %s AND t.revoked_at IS NULL""",
+                 (_token_hash(plaintext),))
+    return rows[0] if rows else None
+
+
+def touch_api_token(conn, token_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE api_tokens SET last_used_at = NOW() WHERE id = %s", (token_id,))
+
+
+def revoke_api_token(conn, token_id: int, actor: str) -> Optional[str]:
+    rows = _rows(conn, """UPDATE api_tokens SET revoked_at = NOW()
+                           WHERE id = %s AND revoked_at IS NULL RETURNING name""", (token_id,))
+    if rows:
+        history_add(conn, actor, f"Revoked API token {rows[0]['name']}")
+        return rows[0]["name"]
+    return None
 
 
 def set_password(conn, user_id: int, password: str) -> None:
