@@ -317,6 +317,9 @@ def _channel_summary(cid: str, values: dict) -> str:
     if cid == "freshdesk" and v("FRESHDESK_DOMAIN"):
         host = urlsplit(notifiers.freshdesk_url(v("FRESHDESK_DOMAIN"))).netloc
         return f"{host} · from {v('FRESHDESK_REQUESTER_EMAIL') or 'nobody yet'}"
+    if cid == "freshservice" and v("FRESHSERVICE_DOMAIN"):
+        host = urlsplit(notifiers.freshservice_url(v("FRESHSERVICE_DOMAIN"))).netloc
+        return f"{host} · from {v('FRESHSERVICE_REQUESTER_EMAIL') or 'nobody yet'}"
     if cid == "pushover" and v("PUSHOVER_USER"):
         return f"priority {effective(values, 'PUSHOVER_PRIORITY')} for new incidents"
     if cid == "pagerduty" and v("PAGERDUTY_ROUTING_KEY"):
@@ -536,6 +539,11 @@ def run_test(channel: str) -> tuple[bool, str]:
             status = notifiers.FRESHDESK_STATUSES.get(notifiers.FRESHDESK_RESOLVED_STATUS, "")
             message = (f"Test ticket {result['number']} created and "
                        + (f"set to {status}." if notifiers.FRESHDESK_RESOLVE else "given a closing note."))
+        elif channel == "freshservice":
+            sender({**row, "event": "resolved", "ticket_ref": result["ref"]})
+            status = notifiers.FRESHSERVICE_STATUSES.get(notifiers.FRESHSERVICE_RESOLVED_STATUS, "")
+            message = (f"Test ticket {result['number']} created and "
+                       + (f"set to {status}." if notifiers.FRESHSERVICE_RESOLVE else "given a closing note."))
         elif channel == "pagerduty":
             sender({**row, "event": "resolved"})
             message = "Test alert triggered and resolved again."

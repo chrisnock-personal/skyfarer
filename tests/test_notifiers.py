@@ -432,6 +432,89 @@ class Freshdesk(unittest.TestCase):
                 self.assertTrue(any("Freshdesk" in e for e in notifiers.config_errors()), name)
 
 
+class Freshservice(unittest.TestCase):
+    def setUp(self):
+        settings = {"FRESHSERVICE_URL": "https://acme.freshservice.com", "FRESHSERVICE_API_KEY": "key",
+                    "FRESHSERVICE_REQUESTER": "skyfarer@example.test", "FRESHSERVICE_PRIORITY": "3",
+                    "FRESHSERVICE_GROUP_ID_RAW": "", "FRESHSERVICE_TAGS": ["skyfarer"],
+                    "FRESHSERVICE_RESOLVE": True, "FRESHSERVICE_RESOLVED_STATUS": "4",
+                    "FRESHSERVICE_EXTRA_FIELDS_RAW": ""}
+        for name, value in settings.items():
+            p = mock.patch.object(notifiers, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def send(self, r, *responses):
+        with mock.patch.object(notifiers, "_request", side_effect=list(responses)) as req:
+            result = notifiers.send_freshservice(r)
+        return result, req.call_args_list
+
+    def test_url(self):
+        self.assertEqual(notifiers.freshservice_url("acme"), "https://acme.freshservice.com")
+        self.assertEqual(notifiers.freshservice_url("https://support.example.test/"),
+                         "https://support.example.test")
+
+    def test_opens_a_ticket(self):
+        r = row()
+        r["payload"]["summary"] = "Errors <b>up</b>\nsecond line"
+        result, calls = self.send(r, response(201, b'{"id": 42}'))
+        self.assertEqual(result, {"ref": "42", "number": "#42"})
+        (method, url), kwargs = calls[0].args, calls[0].kwargs
+        self.assertEqual((method, url), ("POST", "https://acme.freshservice.com/api/v2/tickets"))
+        t = kwargs["json"]
+        self.assertEqual((t["email"], t["priority"], t["status"], t["tags"]),
+                         ("skyfarer@example.test", 3, 2, ["skyfarer"]))
+        self.assertEqual(t["source"], 2)
+        self.assertIn("Errors &lt;b&gt;up&lt;/b&gt;<br>second line", t["description"])
+        self.assertLessEqual(len(t["subject"]), 255)
+        self.assertNotIn("group_id", t)
+        self.assertEqual(kwargs["auth"], ("key", "X"))
+
+    def test_group_and_extra_fields(self):
+        with mock.patch.object(notifiers, "FRESHSERVICE_GROUP_ID_RAW", "77"), \
+                mock.patch.object(notifiers, "FRESHSERVICE_EXTRA_FIELDS_RAW",
+                                  '{"custom_fields": {"cf_service": "Cloud"}}'):
+            _, calls = self.send(row(), response(201, b'{"id": 1}'))
+        t = calls[0].kwargs["json"]
+        self.assertEqual(t["group_id"], 77)
+        self.assertEqual(t["custom_fields"], {"cf_service": "Cloud"})
+
+    def test_update_is_a_private_note(self):
+        _, calls = self.send(row("updated", ticket_ref="42"), response(201))
+        self.assertTrue(calls[0].args[1].endswith("/tickets/42/notes"))
+        self.assertIs(calls[0].kwargs["json"]["private"], True)
+
+    def test_resolve_notes_then_sets_the_status(self):
+        _, calls = self.send(row("resolved", ticket_ref="42"), response(201), response(200))
+        self.assertTrue(calls[0].args[1].endswith("/tickets/42/notes"))
+        self.assertEqual((calls[1].args[0], calls[1].args[1]),
+                         ("PUT", "https://acme.freshservice.com/api/v2/tickets/42"))
+        self.assertEqual(calls[1].kwargs["json"], {"status": 4})
+        with mock.patch.object(notifiers, "FRESHSERVICE_RESOLVE", False):
+            _, calls = self.send(row("resolved", ticket_ref="42"), response(201))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("manual review", calls[0].kwargs["json"]["body"])
+
+    def test_refusals_name_the_field(self):
+        body = b'{"description": "Validation failed", "errors": [{"field": "cf_service", "message": "It should be one of these values: Cloud,Compute", "code": "invalid_value"}]}'
+        with self.assertRaises(notifiers.PermanentFailure) as caught:
+            self.send(row("resolved", ticket_ref="42"), response(201), response(400, body))
+        self.assertIn("cf_service: It should be one of these values", str(caught.exception))
+        for status in (401, 429, 503):
+            with self.assertRaises(notifiers.RetryLater):
+                self.send(row(), response(status))
+
+    def test_config_errors(self):
+        self.assertEqual([e for e in notifiers.config_errors() if "Freshservice" in e], [])
+        self.assertIn("freshservice", notifiers.enabled_channels())
+        for name, value in (("FRESHSERVICE_API_KEY", ""), ("FRESHSERVICE_REQUESTER", "nobody"),
+                            ("FRESHSERVICE_PRIORITY", "9"), ("FRESHSERVICE_RESOLVED_STATUS", "3"),
+                            ("FRESHSERVICE_GROUP_ID_RAW", "sales"),
+                            ("FRESHSERVICE_EXTRA_FIELDS_RAW", "[]")):
+            with mock.patch.object(notifiers, name, value):
+                self.assertTrue(any("Freshservice" in e for e in notifiers.config_errors()), name)
+
+
 class Webhook(unittest.TestCase):
     def hook(self, **fields):
         return notifiers.Webhook(**{"id": 3, "name": "Test", "url": "https://hooks.example.test/in",
@@ -568,11 +651,10 @@ class Delivery(unittest.TestCase):
                 "created_at": when, "next_attempt_at": when - timedelta(seconds=1)}
         return {**base, **extra}
 
-    def deliver(self, rows, sender):
-        with mock.patch.object(notifiers, "enabled_channels",
-                               return_value=["zendesk", "servicenow", "teams"]), \
+    def deliver(self, rows, sender, *, channels=("zendesk", "servicenow", "teams")):
+        with mock.patch.object(notifiers, "enabled_channels", return_value=list(channels)), \
                 mock.patch.dict(notifiers.SENDERS, {"zendesk": sender, "servicenow": sender,
-                                                    "teams": sender}), \
+                                                    "freshservice": sender, "teams": sender}), \
                 mock.patch.object(notifiers.db, "get_conn"), \
                 mock.patch.object(notifiers.db, "pending_notifications", return_value=rows), \
                 mock.patch.object(notifiers.db, "notification_sent"), \
@@ -606,6 +688,19 @@ class Delivery(unittest.TestCase):
         sent, _, _ = self.deliver(rows, sender)
         self.assertEqual((sent, seen), (2, [None, "c" * 32]))
         self.stored.assert_called_once_with(mock.ANY, 7, "servicenow", ref="c" * 32, number="INC1")
+
+    def test_freshservice_ticket_ref_is_stored(self):
+        seen = []
+
+        def sender(r):
+            seen.append(r.get("ticket_ref"))
+            return {"ref": "43", "number": "#43"} if r["event"] == "opened" else None
+
+        rows = [self.queued(1, "opened", channel="freshservice"),
+                self.queued(2, "updated", channel="freshservice")]
+        sent, _, _ = self.deliver(rows, sender, channels=("freshservice",))
+        self.assertEqual((sent, seen), (2, [None, "43"]))
+        self.stored.assert_called_once_with(mock.ANY, 7, "freshservice", ref="43", number="#43")
 
     def test_a_retry_holds_back_later_notices_for_that_incident_and_channel(self):
         calls = []
