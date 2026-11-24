@@ -63,6 +63,18 @@ class Applying(unittest.TestCase):
         self.assertEqual(feeds.HETZNER_REGIONS, ["FSN1"])
         self.assertIn("teams", notifiers.enabled_channels())
 
+    def test_provider_api_keys_are_managed_secrets(self):
+        for key in ("DIGITALOCEAN_API_KEY", "LINODE_API_KEY", "HETZNER_API_KEY"):
+            self.assertIn(key, settings.FIELDS)
+            self.assertTrue(settings.is_secret(key), key)
+            self.assertIn(key, settings.MANAGED)
+        values = {"HETZNER_REGIONS": "FSN1", "HETZNER_API_KEY": "secret"}
+        self.apply(values)
+        self.assertEqual(os.getenv("HETZNER_API_KEY"), "secret")
+        values["HETZNER_ENABLED"] = "false"
+        self.apply(values)
+        self.assertNotIn("HETZNER_API_KEY", os.environ)
+
     def test_webhook_with_unreadable_secret_is_held_back(self):
         rows = [{"id": 2, "enabled": True, "name": "n8n", "url": "https://a.example.test/",
                  "method": "POST", "template": "", "content_type": "application/json", "events": ""}]

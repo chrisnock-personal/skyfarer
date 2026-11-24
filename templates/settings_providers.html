@@ -3,7 +3,7 @@
 {% block heading %}
 <div>
   <h1>Providers and regions</h1>
-  <p class="lede">Skyfarer reads each provider's public status page and keeps what touches these regions. Use the provider's own names; codes match as whole words, and <code class="mono">*</code> keeps everything that provider publishes.</p>
+  <p class="lede">Skyfarer reads each provider's public status page and keeps what touches these regions. Use the provider's own names; codes match as whole words, and <code class="mono">*</code> keeps everything that provider publishes. On DigitalOcean, Hetzner and Linode, an optional read-only key also watches the regions your resources are in and counts them in incidents.</p>
 </div>
 {% endblock %}
 {% macro tag_editor(key, values, what, placeholder, suggestions=[]) %}
@@ -23,6 +23,28 @@
 </div>
 <input type="hidden" name="{{ key }}" value="{{ values|join(',') }}" data-store>
 {% endmacro %}
+{% macro api_key_field(key, label, secret, unreadable, help) %}
+<div class="field" style="margin-top: 12px">
+  <span class="label" id="lbl-{{ key }}">{{ label }}</span>
+  {% if key in secret %}
+  <details class="replace">
+    <summary aria-label="{{ label }}: stored, {{ 'unreadable' if key in unreadable else secret[key].updated_at }}. Replace or remove">
+      <div class="stored {{ 'bad' if key in unreadable }}"><span><strong>{{ 'Unreadable' if key in unreadable else 'Stored' }}</strong> · {{ 'enter it again' if key in unreadable else secret[key].updated_at.strftime('%d %b %H:%M UTC') }}</span><span class="btn small" style="flex: none">Replace</span></div>
+    </summary>
+    <div class="new">
+      <input class="input" type="password" name="{{ key }}" autocomplete="off" aria-labelledby="lbl-{{ key }}" placeholder="Paste the new key">
+      <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center">
+        <label class="check"><input type="checkbox" name="remove_{{ key }}" value="1"> Remove it</label>
+        <button type="button" class="btn small" onclick="var d=this.closest('details'); d.querySelectorAll('input').forEach(function(i){ if (i.type==='checkbox') i.checked=false; else i.value=''; }); d.open=false;">Keep current</button>
+      </div>
+    </div>
+  </details>
+  {% else %}
+  <input class="input" type="password" name="{{ key }}" autocomplete="off" aria-labelledby="lbl-{{ key }}" placeholder="Not set">
+  {% endif %}
+  {% if help %}<span class="help">{{ help }}</span>{% endif %}
+</div>
+{% endmacro %}
 {% block content %}
 <noscript><div class="flash bad">This page needs JavaScript to edit regions.</div></noscript>
 <form method="post" action="{{ url_for('admin.providers') }}" id="providers-form">
@@ -40,7 +62,11 @@
         <input type="checkbox" class="switch" id="en-{{ c.p.key }}" name="{{ c.p.enabled_key }}" value="true" {% if c.on %}checked{% endif %}>
       </div>
       {{ tag_editor(c.p.key, c.regions, 'Regions', 'Add a region to ' ~ c.p.label, c.suggestions) }}
-      {% if c.on and not c.regions %}<p class="hint warn">No regions yet, so nothing from {{ c.p.label }} is kept.</p>{% endif %}
+      {% if c.discovered %}<p class="hint">Watched from your account: {{ c.discovered }}. These are read from the provider's API, not from your own services.</p>{% endif %}
+      {% if c.on and not c.regions and not c.discovered %}<p class="hint warn">No regions yet, so nothing from {{ c.p.label }} is kept.</p>{% endif %}
+      {% if c.p.discovers %}
+      {{ api_key_field(c.p.api_key_key, 'Read-only account key', secrets, unreadable, api_help[c.p.api_key_key]) }}
+      {% endif %}
     </section>
   {% endfor %}
 

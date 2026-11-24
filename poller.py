@@ -38,6 +38,7 @@ load_dotenv()
 import db  # noqa: E402
 import feeds  # noqa: E402
 import notifiers  # noqa: E402
+import providers  # noqa: E402
 import settings  # noqa: E402
 from feeds import FeedEntry, fmt_dt  # noqa: E402
 
@@ -82,13 +83,25 @@ def preflight(dry_run: bool = False) -> bool:
 
 # ─── Incident lifecycle ─────────────────────────────────────────────────────
 
-def _notice(entry: FeedEntry, **extra) -> dict:
+def _impact(entry: FeedEntry) -> dict | None:
+    """The account resources this entry's regions touch, if there's a usable
+    account read for its provider."""
+    return providers.impact(entry.provider, _regions(entry.region))
+
+
+def _notice(entry: FeedEntry, *, impact: dict | None = None, **extra) -> dict:
     """What a channel needs to know, as stored in the delivery queue."""
-    return {
+    notice = {
         "provider": entry.provider, "region": entry.region, "title": entry.title,
         "summary": entry.summary, "link": entry.link, "published": entry.published,
         "updated": entry.updated, "noticed": _now_utc(), **extra,
     }
+    if impact is None:
+        impact = _impact(entry)
+    if impact is not None:
+        notice["resource_impact"] = impact
+        notice["resources_affected"] = impact["total"]
+    return notice
 
 
 def _worth_alerting(entry: FeedEntry) -> bool:
@@ -107,22 +120,30 @@ def _worth_alerting(entry: FeedEntry) -> bool:
 
 
 def _notify(conn, incident_id: int, event: str, entry: FeedEntry, dry_run: bool,
-            *, alert: bool = True, **extra) -> None:
+            *, alert: bool = True, impact: dict | None = None, **extra) -> None:
+    if impact is None:
+        impact = _impact(entry)
     if dry_run:
         log.info("[DRY-RUN] Would send %s notices for %s", event, entry.title)
     else:
-        notifiers.enqueue(conn, incident_id, event, _notice(entry, **extra), alert=alert)
+        if impact is not None:
+            db.update_resource_impact(conn, incident_id, impact["regions"], impact["total"])
+        notifiers.enqueue(conn, incident_id, event,
+                          _notice(entry, impact=impact, **extra), alert=alert)
 
 
 def _record_new(conn, entry: FeedEntry, dry_run: bool) -> None:
     """First sight of an incident: store it, and queue notices unless it's
     already over."""
+    impact = _impact(entry)
     fields = dict(
         guid=entry.guid, provider=entry.provider, region=entry.region,
         title=entry.title, summary=entry.summary, link=entry.link,
         feed_published=entry.published, feed_updated=entry.updated,
         ticket_id=None, detected_at=entry.published_dt,
         is_maintenance=entry.is_maintenance,
+        resource_counts=impact["regions"] if impact is not None else None,
+        resources_affected=impact["total"] if impact is not None else None,
     )
     if entry.is_resolved:
         log.info("Skipping already-resolved: %s – %s", entry.provider, entry.title)
@@ -133,7 +154,7 @@ def _record_new(conn, entry: FeedEntry, dry_run: bool) -> None:
     incident_id = db.insert_incident(conn, state="open", **fields)
     if incident_id is not None:
         _notify(conn, incident_id, "opened", entry, dry_run,
-                alert=_worth_alerting(entry))
+                alert=_worth_alerting(entry), impact=impact)
 
 
 def _resolve_incident(conn, rec: dict, entry: FeedEntry, dry_run: bool) -> None:
@@ -273,9 +294,32 @@ def fetch_all(errors: feeds.FeedErrors):
     return entries, azure_listed, hetzner_listed
 
 
+_seeded: list[bool] = []
+
+
+def _seed_discovery() -> None:
+    """Once per process, load the last good account read from Postgres, so a
+    provider API that is down when the poller restarts keeps its regions."""
+    if _seeded:
+        return
+    try:
+        with db.get_conn() as conn:
+            providers.seed(db.provider_resources(conn))
+        _seeded.append(True)
+    except Exception as exc:  # the poll cycle reports database trouble itself
+        log.warning("Couldn't load the last account read: %s", exc)
+
+
 def poll_once(dry_run: bool = False) -> tuple[int, int]:
     """Run one poll cycle. Returns (incidents_created, incidents_resolved)."""
     errors = feeds.FeedErrors()
+    _seed_discovery()
+    discovered, api_errors, cleared = providers.discover()
+    for name, reason in api_errors.items():
+        errors.add(f"{name} API", reason)
+    # Account regions are watched alongside the configured ones for this
+    # cycle. settings.apply() resets them before the next one.
+    feeds.apply_discovered(discovered)
     all_entries, azure_listed, hetzner_listed = fetch_all(errors)
     created = 0
     resolved = 0
@@ -283,6 +327,7 @@ def poll_once(dry_run: bool = False) -> tuple[int, int]:
 
     try:
         with db.get_conn() as conn:
+            db.replace_provider_resources(conn, discovered, cleared, api_errors)
             known_guids = db.get_known_guids(conn)
             open_incidents = db.get_open_guids(conn)
 

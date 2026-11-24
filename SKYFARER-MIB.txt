@@ -58,20 +58,32 @@ sfIncidentId OBJECT-TYPE
     DESCRIPTION "Stable across one incident's traps, for correlating them."
     ::= { sfObjects 5 }
 
+sfResourcesAffected OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  accessible-for-notify
+    STATUS      current
+    DESCRIPTION "How many of your account's resources are in the affected
+                 regions, from an optional provider API read. -1 means no
+                 account key was read or the read failed."
+    ::= { sfObjects 6 }
+
 sfIncidentOpened NOTIFICATION-TYPE
-    OBJECTS     { sfProvider, sfRegion, sfTitle, sfLink, sfIncidentId }
+    OBJECTS     { sfProvider, sfRegion, sfTitle, sfLink, sfIncidentId,
+                  sfResourcesAffected }
     STATUS      current
     DESCRIPTION "A new incident in a watched region."
     ::= { sfNotifications 1 }
 
 sfIncidentUpdated NOTIFICATION-TYPE
-    OBJECTS     { sfProvider, sfRegion, sfTitle, sfLink, sfIncidentId }
+    OBJECTS     { sfProvider, sfRegion, sfTitle, sfLink, sfIncidentId,
+                  sfResourcesAffected }
     STATUS      current
     DESCRIPTION "The provider posted an update on an open incident."
     ::= { sfNotifications 2 }
 
 sfIncidentResolved NOTIFICATION-TYPE
-    OBJECTS     { sfProvider, sfRegion, sfTitle, sfLink, sfIncidentId }
+    OBJECTS     { sfProvider, sfRegion, sfTitle, sfLink, sfIncidentId,
+                  sfResourcesAffected }
     STATUS      current
     DESCRIPTION "The provider says the incident is over."
     ::= { sfNotifications 3 }
