@@ -12,6 +12,7 @@ claim the admin account.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -718,7 +719,8 @@ def rules():
     for key in ("NOTIFY_MAX_AGE_HOURS", "NOTIFY_RETRY_HOURS"):
         raw = form.get(key, "").strip()
         try:
-            if float(raw) < 0:
+            number = float(raw)
+            if not math.isfinite(number) or number < 0:
                 raise ValueError
             proposed[key] = raw
         except ValueError:
