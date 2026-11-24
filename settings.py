@@ -257,6 +257,12 @@ def label(key: str) -> str:
                 return f"{c.name}: {f.label[0].lower() + f.label[1:]}"
     if key in FIELDS:
         return FIELDS[key].label
+    if key.startswith("SLA_TARGET_"):
+        name = key[len("SLA_TARGET_"):]
+        for p in PROVIDERS:
+            if p.name.upper() == name.upper():
+                return f"{p.label} availability target"
+        return f"{name} availability target"
     if key.startswith("WEBHOOK_"):
         part = key.split("_", 2)[2]
         return "Webhook: " + {"SECRET": "signing secret", "HEADERS": "extra headers"}.get(part, part.lower())

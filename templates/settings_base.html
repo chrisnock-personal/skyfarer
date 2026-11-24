@@ -3,7 +3,7 @@
 <div class="settings-wrap">
   <nav class="settings-nav" aria-label="Settings">
     <span class="eyebrow">Settings</span>
-    {% for endpoint, label in [('admin.providers', 'Providers and regions'), ('admin.channels', 'Channels'), ('admin.users', 'Users and access')] %}
+    {% for endpoint, label in [('admin.providers', 'Providers and regions'), ('admin.channels', 'Channels'), ('admin.sla', 'SLA targets'), ('admin.users', 'Users and access')] %}
     <a href="{{ url_for(endpoint) }}" {% if request.endpoint == endpoint or (endpoint == 'admin.channels' and request.endpoint.startswith(('admin.channel', 'admin.webhook', 'admin.rules'))) or (endpoint == 'admin.users' and request.endpoint.startswith('admin.user')) %}class="current" aria-current="page"{% endif %}>{{ label }}</a>
     {% endfor %}
   </nav>

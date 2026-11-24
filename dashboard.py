@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
-from flask import Flask, render_template, request
+from flask import Flask, Response, render_template, request, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from psycopg2.extras import RealDictCursor
 
@@ -27,6 +27,7 @@ load_dotenv()
 
 import db  # noqa: E402
 import feeds  # noqa: E402
+import history  # noqa: E402
 import notifiers  # noqa: E402
 import settings  # noqa: E402
 from admin import bp as admin_bp  # noqa: E402
@@ -442,6 +443,76 @@ def index():
         range_key=range_key, range_labels=RANGE_LABELS, state_labels=STATE_LABELS,
         from_date=from_date, to_date=to_date,
         link=link, now=now,
+    )
+
+
+@app.get("/history")
+def history_page():
+    """History & SLA: the stored incident timeline shown as availability,
+    error budgets and a per-provider breakdown."""
+    range_key = request.args.get("range", "quarter")
+    range_key = range_key if range_key in dict(history.RANGES) else "quarter"
+    from_date = request.args.get("from", "").strip()
+    to_date = request.args.get("to", "").strip()
+    start, end = history.window(range_key, from_date, to_date)
+
+    rows = _query("""
+        SELECT provider, region, title, link, state, is_maintenance,
+               detected_at, resolved_at
+          FROM incidents
+         WHERE detected_at < %s AND (resolved_at IS NULL OR resolved_at >= %s)
+         ORDER BY detected_at DESC LIMIT 5000
+    """, (end, start))
+
+    # Include regions found through account keys, as the Providers cards do.
+    watched = feeds.watched_regions(_provider_resources())
+    provider_names = list(dict.fromkeys(
+        [*feeds.PROVIDER_NAMES, *watched, *(r["provider"] for r in rows)]))
+    region_names = sorted({r.strip() for regions in watched.values() for r in regions}
+                          | {r.strip() for row in rows
+                             for r in (row["region"] or "").split(",") if r.strip()})
+    provider = request.args.get("provider", "all")
+    region = request.args.get("region", "all")
+    provider = provider if provider == "all" or provider in provider_names else "all"
+    region = region if region == "all" or region in region_names else "all"
+
+    with db.get_conn() as conn:
+        values = settings.load(conn)
+    # Only providers in view count towards the overall availability and error
+    # budget: watched ones, and any with incidents in this window. A switched-off
+    # provider would otherwise add a perfect 100% and dilute real downtime.
+    in_view = [name for name in provider_names
+               if watched.get(name) or any(r["provider"] == name for r in rows)
+               or name == provider]
+    targets = {name: history.target_value(values, name) for name in in_view}
+    report = history.build(rows, start, end, targets,
+                           provider=provider, region=region, now=end)
+
+    if request.args.get("format") == "csv":
+        filename = f"skyfarer-history-{end:%Y%m%d}.csv"
+        return Response(history.csv_export(report), mimetype="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    current = {"range": range_key, "from": from_date, "to": to_date,
+               "provider": provider, "region": region}
+
+    def link(**overrides):
+        params = dict(current)
+        if "date_from" in overrides:
+            params["from"] = overrides.pop("date_from")
+        if "date_to" in overrides:
+            params["to"] = overrides.pop("date_to")
+        params.update(overrides)
+        params = {k: v for k, v in params.items() if v}
+        return url_for("history_page", **params)
+
+    return render_template(
+        "history.html", report=report, range_key=range_key,
+        range_labels=history.RANGES, from_date=from_date, to_date=to_date,
+        provider=provider, region=region,
+        provider_options=[(p, PROVIDER_LABELS.get(p, p)) for p in provider_names],
+        provider_labels=PROVIDER_LABELS, region_options=region_names, link=link,
+        now=datetime.now(timezone.utc),
     )
 
 
