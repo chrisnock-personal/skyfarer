@@ -1,8 +1,30 @@
-feedparser>=6.0
-requests>=2.28
-python-dotenv>=1.0
-psycopg2-binary>=2.9
-Flask>=3.0
-pysnmp>=7.1,<8
-cryptography>=42
-gunicorn>=22
+# Pinned 2026-11-24 from a clean Python 3.12 install. Direct dependencies are
+# listed first; the rest are their current transitive dependencies. Keep both
+# sections pinned so Docker, CI and local installs resolve the same versions.
+# Refresh deliberately, then run the full test suite on Python 3.12.
+
+# Direct
+feedparser==6.0.14
+requests==2.34.2
+python-dotenv==1.2.4
+psycopg2-binary==2.9.13
+Flask==3.1.3
+pysnmp==7.1.34
+cryptography==50.0.2
+gunicorn==27.0.1
+
+# Transitive
+blinker==1.9.0
+certifi==2026.11.20
+cffi==2.1.1
+charset-normalizer==3.5.3
+click==8.5.1
+feedparser-sgmllib==2.1.0
+idna==3.20
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+pyasn1==0.6.5
+pycparser==3.12
+urllib3==2.8.0
+Werkzeug==3.1.9

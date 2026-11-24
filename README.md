@@ -724,6 +724,10 @@ python dashboard.py                  # the dashboard, on :8080 (Flask's own serv
 gunicorn --workers 2 --threads 8 --bind 0.0.0.0:8080 wsgi:app   # as compose runs it
 ```
 
+`requirements.txt` pins both direct and transitive packages, so Docker, CI and
+local installs resolve the same versions. Refresh those pins deliberately and
+run the full suite on Python 3.12, the version in the image.
+
 The dashboard can use several workers (set `DASHBOARD_WORKERS` in compose) or
 replicas: the first-run setup code and the sign-in throttle are in Postgres.
 
