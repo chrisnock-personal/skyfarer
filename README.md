@@ -11,7 +11,10 @@ Cloudflare and Scaleway for incidents and maintenance in the regions you care
 about. It raises Zendesk, ServiceNow, Jira Service Management, Freshdesk or
 Freshservice tickets and sends Pushover, PagerDuty, Microsoft Teams, SNMP trap and webhook
 notifications, keeps the tickets up to date as the provider posts, then
-follows up when the provider marks the incident clear.
+follows up when the provider marks the incident clear. With an optional
+read-only key on DigitalOcean, Hetzner or Linode, it also discovers which
+regions hold your resources and says how many an incident touches. It never
+monitors the health of individual VMs or services.
 
 Providers, regions, channels and their keys are set in the dashboard, by
 admins; viewers see the dashboard only. Everything is held in **Postgres**,
@@ -74,13 +77,15 @@ light, and the browser remembers the choice. It shows:
   notices, and the last poll cycle
 - A card per watched provider: its regions, and whether it's operational,
   has open incidents, is in maintenance, or had a feed that couldn't be read
-  on the last poll
+  on the last poll. Where an account key is set, regions discovered from it
+  and their resource counts are shown too
 - Delivery health per notification channel, and a chart of the last 24 poll
   cycles with failures marked
 - The `incidents` table: live incidents first, then maintenance under way,
   then upcoming work (soonest first). Filter by state (Active / Resolved /
-  All) and provider; ticket numbers link to the ticket in Zendesk, ServiceNow,
-  Jira, Freshdesk or Freshservice
+  All) and provider, with the number of your account's resources in the
+  affected regions where an account key is set; ticket numbers link to the
+  ticket in Zendesk, ServiceNow, Jira, Freshdesk or Freshservice
 - The last 50 notifications, with their status, attempts and any error
 - The last 50 rows of `poll_log`, with errors called out
 - Full-text search across incident title, summary, region, provider, and
@@ -102,7 +107,11 @@ dashboard:
 
 - **Providers and regions.** Each provider can be switched on or off without
   losing its regions. Regions are added as tags, with suggestions of common
-  codes, and there's the keyword filter and the poll interval.
+  codes, and there's the keyword filter and the poll interval. DigitalOcean,
+  Hetzner and Linode also take an optional read-only account key: it watches
+  the regions with your resources and counts them in incidents, without
+  configuring those regions by hand. Secrets are replaced or removed the same
+  way as channel keys.
 - **Channels.** The alert rules (which events, how old is too old, how long to
   retry, maintenance), then Zendesk, ServiceNow, Jira Service Management,
   Freshdesk, Freshservice, Pushover, PagerDuty, Teams and SNMP, each with its
@@ -173,6 +182,8 @@ Secret changes are recorded as "replaced" or "removed", never with the value.
 | summary | text | cleaned description (for AWS and Azure, the newest update's) |
 | update_count | integer | later AWS or Azure entries attached to this incident |
 | is_maintenance | boolean | planned work rather than a fault |
+| resource_counts | jsonb | `{region: count}` from the latest account API read; NULL when there is no usable key |
+| resources_affected | integer | total of `resource_counts` for the incident's regions; NULL when there is no usable key |
 | link | text | URL to status page |
 | feed_published | text | published timestamp from RSS |
 | feed_updated | text | updated timestamp from RSS |
@@ -218,6 +229,19 @@ Records in ticketing systems other than Zendesk, whose ticket number is
 | ref | text | the system's own ID (a ServiceNow `sys_id`, a Jira key, a Freshdesk or Freshservice ticket ID) |
 | number | text | what people call it (`INC0010001`, `ITSM-12`, `#42`) |
 | created_at | timestamptz | when it was created |
+
+### `provider_resources`
+
+The last good read from each optional account API, one row per provider and
+region. The poller refreshes it each cycle; a failed read leaves the old rows
+in place, and removing a key clears them.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| provider | text | `DigitalOcean`, `Hetzner` or `Linode` (part of the PK) |
+| region | text | status-page region code (part of the PK) |
+| count | integer | number of that provider's compute resources in the region |
+| discovered_at | timestamptz | when the read succeeded |
 
 ### `notifications`
 
@@ -437,8 +461,14 @@ default a webhook sends a JSON document:
 {"source": "skyfarer", "event": "opened", "incident_id": 42, "provider": "DigitalOcean",
  "region": "LON1", "title": "Droplet creates failing in LON1", "summary": "Investigating: ...",
  "link": "https://status.digitalocean.com/incidents/abc123", "published": "2026-11-08 15:03 UTC",
- "updated": "2026-11-08 15:03 UTC", "noticed": "2026-11-08 15:03 UTC", "update_count": 0}
+ "updated": "2026-11-08 15:03 UTC", "noticed": "2026-11-08 15:03 UTC", "update_count": 0,
+ "resources_affected": 3, "resource_impact": {"total": 3, "regions": {"LON1": 3}}}
 ```
+
+They are blank when there's no usable account key. A zero means the key was
+read and none of that account's resources are in the affected regions. Tickets
+and alerts leave out the count when there's no key; SNMP traps carry it as
+`sfResourcesAffected` (`-1` when unknown).
 
 `incident_id` is the same on an incident's `opened` and `resolved` notices, so
 the receiver can pair them; the `X-Skyfarer-Event` and `X-Skyfarer-Incident`
@@ -513,7 +543,11 @@ database at all:
    categories `Network` or `General`, or `*`, to catch those.
 
    `*` watches everything a provider publishes. A provider with no regions, or
-   switched off under Settings, isn't read at all.
+   switched off under Settings, isn't read at all —except that an optional
+   account key on DigitalOcean, Hetzner or Linode adds the regions where your
+   resources are. Only those providers' compute instances are counted (Droplets,
+   servers and Linodes); no individual VM or service is checked. The key is
+   read-only, and a failed API read leaves the last good region list in place.
 2. **Keywords** (`FILTER_KEYWORDS`, optional) -a comma-separated list of
    words. If set, an entry must also contain at least one of these
    (case-insensitive, matched against title + summary) to be ingested.

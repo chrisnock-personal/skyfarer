@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import notifiers  # noqa: E402
 import feeds  # noqa: E402
 import poller  # noqa: E402
+import providers  # noqa: E402
 
 NOTICE = {
     "provider": "AWS", "region": "eu-west-2", "title": "Service impact",
@@ -79,6 +80,34 @@ class Payloads(unittest.TestCase):
         self.assertNotIn("group_id", notifiers.zendesk_ticket(row())["ticket"])
         with mock.patch.object(notifiers, "ZD_GROUP_ID", 42):
             self.assertEqual(notifiers.zendesk_ticket(row())["ticket"]["group_id"], 42)
+
+    def test_resource_count_reaches_notices_and_channels(self):
+        entry = feeds.FeedEntry(
+            provider="DigitalOcean", region="LON1", guid="digitalocean:1",
+            title="Impact", summary="Detail", link="https://example.test/i/1",
+            published="", updated="", is_resolved=False,
+            published_dt=None, updated_dt=None)
+        impact = {"total": 3, "regions": {"LON1": 3}}
+        with mock.patch.object(providers, "DISCOVERED", {"DigitalOcean": {"LON1": 3}}), \
+             mock.patch.object(providers, "ERRORS", {}), \
+             mock.patch.dict(os.environ, {"DIGITALOCEAN_API_KEY": "token"}):
+            notice = poller._notice(entry)
+            r = row()
+            r["payload"] = notice
+            body = notifiers.zendesk_ticket(r)["ticket"]["comment"]["body"]
+        self.assertEqual(notice["resources_affected"], 3)
+        self.assertEqual(notice["resource_impact"], impact)
+        self.assertIn("Account resources in affected regions: 3 (LON1: 3)", body)
+        webhook = notifiers.webhook_values(r)
+        self.assertEqual(webhook["resources_affected"], 3)
+
+    def test_no_account_key_leaves_resources_unknown(self):
+        r = row()
+        # Webhooks always carry every field; blank means there was no read,
+        # while 0 would mean a key was read and no resources were affected.
+        self.assertEqual(notifiers.webhook_values(r)["resources_affected"], "")
+        self.assertEqual(notifiers.webhook_values(r)["resource_impact"], "")
+        self.assertEqual(notifiers.snmp_varbinds(r)[-1][1], -1)
 
     def test_zendesk_updates_stay_internal(self):
         self.assertIs(notifiers.zendesk_resolve(row())["ticket"]["comment"]["public"], False)
@@ -469,6 +498,12 @@ class Freshservice(unittest.TestCase):
         self.assertLessEqual(len(t["subject"]), 255)
         self.assertNotIn("group_id", t)
         self.assertEqual(kwargs["auth"], ("key", "X"))
+
+    def test_ticket_names_the_affected_resources(self):
+        r = row()
+        r["payload"]["resource_impact"] = {"total": 2, "regions": {"LON1": 2}}
+        description = notifiers.freshservice_ticket(r)["description"]
+        self.assertIn("Account resources in affected regions: 2 (LON1: 2)", description)
 
     def test_group_and_extra_fields(self):
         with mock.patch.object(notifiers, "FRESHSERVICE_GROUP_ID_RAW", "77"), \

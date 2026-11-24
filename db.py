@@ -66,6 +66,12 @@ ALTER TABLE incidents ADD COLUMN IF NOT EXISTS update_count INTEGER NOT NULL DEF
 -- Planned work rather than a fault (scheduled maintenance).
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS is_maintenance BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Account resources an incident touches, from an optional provider API key.
+-- resource_counts is {region: count}; NULL means no key/snapshot for that
+-- provider, while an empty object means the key was read and found none there.
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resource_counts JSONB;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resources_affected INTEGER;
+
 CREATE INDEX IF NOT EXISTS idx_incidents_state ON incidents (state);
 CREATE INDEX IF NOT EXISTS idx_incidents_provider ON incidents (provider);
 
@@ -108,6 +114,16 @@ CREATE TABLE IF NOT EXISTS poll_log (
     tickets_resolved INTEGER NOT NULL DEFAULT 0,
     open_count      INTEGER NOT NULL DEFAULT 0,
     error           TEXT
+);
+
+-- Last good read of each provider's account API: how many resources the
+-- account has in each region. Only providers with an API key have rows here.
+CREATE TABLE IF NOT EXISTS provider_resources (
+    provider       TEXT NOT NULL,
+    region         TEXT NOT NULL,
+    count          INTEGER NOT NULL,
+    discovered_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (provider, region)
 );
 
 -- Records in ticketing systems other than Zendesk (whose ticket number is
@@ -246,7 +262,9 @@ def insert_incident(conn, *, guid: str, provider: str, region: str,
                     state: str, ticket_id: int | None,
                     detected_at: datetime | None = None,
                     resolved_at: datetime | None = None,
-                    is_maintenance: bool = False) -> int | None:
+                    is_maintenance: bool = False,
+                    resource_counts: dict | None = None,
+                    resources_affected: int | None = None) -> int | None:
     """Insert a new incident row and return its ID (None if it already exists).
 
     detected_at / resolved_at reflect the real incident timeline (the feed's
@@ -263,15 +281,56 @@ def insert_incident(conn, *, guid: str, provider: str, region: str,
             INSERT INTO incidents
                 (guid, provider, region, title, summary, link,
                  feed_published, feed_updated, state, ticket_id,
-                 detected_at, resolved_at, ingested_at, is_maintenance)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 detected_at, resolved_at, ingested_at, is_maintenance,
+                 resource_counts, resources_affected)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (guid) DO NOTHING
             RETURNING id
         """, (guid, provider, region, title, summary, link,
               feed_published, feed_updated, state, ticket_id,
-              detected_at, resolved_at, now, is_maintenance))
+              detected_at, resolved_at, now, is_maintenance,
+              Json(resource_counts) if resource_counts is not None else None,
+              resources_affected))
         row = cur.fetchone()
         return row[0] if row else None
+
+
+def update_resource_impact(conn, incident_id: int, counts: dict,
+                           affected: int) -> None:
+    """Keep an incident's resource count in step with the last account read."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE incidents
+               SET resource_counts = %s, resources_affected = %s, updated_at = %s
+             WHERE id = %s
+        """, (Json(counts), affected, datetime.now(timezone.utc), incident_id))
+
+
+def replace_provider_resources(conn, discovered: dict[str, dict[str, int]],
+                               cleared=(), failed=()) -> None:
+    """Store a good account read. A provider whose read failed keeps its old
+    rows, so a brief API outage doesn't make its regions disappear."""
+    failed = set(failed)
+    with conn.cursor() as cur:
+        for provider in set(discovered) | set(cleared):
+            if provider in failed:
+                continue
+            cur.execute("DELETE FROM provider_resources WHERE provider = %s", (provider,))
+            for region, count in sorted((discovered.get(provider) or {}).items()):
+                cur.execute("""
+                    INSERT INTO provider_resources (provider, region, count)
+                    VALUES (%s, %s, %s)
+                """, (provider, region, count))
+
+
+def provider_resources(conn) -> dict[str, dict[str, int]]:
+    """Last good account read as {provider: {region: count}}."""
+    out: dict[str, dict[str, int]] = {}
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT provider, region, count FROM provider_resources")
+        for row in cur.fetchall():
+            out.setdefault(row["provider"], {})[row["region"]] = row["count"]
+    return out
 
 
 def mark_resolved(conn, guid: str, resolved_at: datetime | None = None) -> None:
