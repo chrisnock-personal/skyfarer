@@ -63,6 +63,7 @@ class Web(unittest.TestCase):
     """Exercise the routes so the shared state is used by the real handlers."""
 
     def setUp(self):
+        admin._logged_code.clear()
         app = Flask(__name__, template_folder=os.path.join(ROOT, "templates"))
         app.config.update(TESTING=True, SECRET_KEY="test-secret")
         app.register_blueprint(admin.bp)
@@ -124,6 +125,15 @@ class Web(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("aa-bb-cc", " ".join(logs.output))
         code.assert_called_with(self.conn)
+
+    def test_setup_code_is_logged_once_per_process(self):
+        settings.user_count.return_value = 0
+        with mock.patch.object(settings, "imported_summary", return_value="nothing set"), \
+                mock.patch.object(db, "setup_code", return_value="aa-bb-cc"), \
+                mock.patch.object(admin.log, "warning") as warning:
+            self.client.get("/setup")
+            self.client.get("/setup")
+        warning.assert_called_once()
 
     def test_setup_uses_the_shared_code_and_removes_it(self):
         settings.user_count.return_value = 0

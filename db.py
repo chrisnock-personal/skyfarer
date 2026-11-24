@@ -202,9 +202,12 @@ def get_conn():
 
 
 def init_schema():
-    """Create tables and indexes if they don't exist."""
+    """Create tables and indexes if they don't exist. Every dashboard worker
+    and the poller run this at start; the lock stops their CREATE TABLE IF NOT
+    EXISTS statements racing, which Postgres can refuse with a unique violation."""
     with get_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(77700)")
             cur.execute(SCHEMA_SQL)
     log.info("Database schema initialised")
 

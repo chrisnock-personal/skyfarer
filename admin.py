@@ -136,10 +136,17 @@ def logout():
     return redirect(url_for("admin.login"))
 
 
+_logged_code: list[str] = []
+
+
 def _the_setup_code(conn) -> str:
     code = db.setup_code(conn)
-    # Log on each visit, not just when the code is made: a worker (or the
-    # container) may have restarted since another one generated it.
+    # Log once per worker process, not just when the code is made: a worker
+    # (or the container) may have restarted since another one generated it.
+    # Not on every visit, so anonymous page loads can't flood the log.
+    if code in _logged_code:
+        return code
+    _logged_code[:] = [code]
     log.warning("First run: no accounts yet. Open the dashboard and enter this "
                 "setup code to create the first admin: %s", code)
     return code
