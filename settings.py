@@ -5,8 +5,10 @@ Settings, users and the change history, kept in Postgres and edited in the
 dashboard.
 
 On the first start with an empty database, the settings found in .env are
-imported once; from then on the database is what counts. Only the database
-connection, the dashboard's address and SKYFARER_SECRET_KEY stay in .env.
+imported once; from then on the database is what counts. Outside that import
+are the database connection, the dashboard's address, SKYFARER_SECRET_KEY, the
+feed URLs (testing overrides) and the API rate limits, which are read when the
+dashboard process starts.
 
 Settings keep the names they have in .env (AWS_REGIONS, ZENDESK_API_TOKEN, ...).
 apply() puts the stored values into the environment and has feeds and notifiers
