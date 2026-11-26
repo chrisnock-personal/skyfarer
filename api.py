@@ -219,7 +219,8 @@ def incident(incident_id: int):
         return api_errors.problem(404, "No such incident.", code="not-found")
     item = rows[0]
     item["updates"] = query("""SELECT * FROM incident_updates WHERE incident_id = %s
-                               ORDER BY created_at""", (incident_id,))
+                               ORDER BY published_at ASC NULLS LAST, ingested_at ASC, id ASC""",
+                            (incident_id,))
     item["tickets"] = query("SELECT * FROM tickets WHERE incident_id = %s ORDER BY system",
                             (incident_id,))
     item["deliveries"] = query("""SELECT id, channel, status, attempts, created_at
