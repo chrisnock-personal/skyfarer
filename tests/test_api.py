@@ -172,6 +172,34 @@ class ApiEndpoints(unittest.TestCase):
             response = self.client.get("/api/v1/incidents/99", headers=self.headers)
         self.assertEqual(response.status_code, 404)
 
+    def test_incident_detail_orders_updates_by_real_columns(self):
+        incident = {"id": 7, "provider": "OVH", "state": "open"}
+        updates = [
+            {"id": 12, "incident_id": 7, "published_at": NOW - timedelta(minutes=5),
+             "ingested_at": NOW, "title": "first"},
+            {"id": 13, "incident_id": 7, "published_at": None,
+             "ingested_at": NOW + timedelta(minutes=5), "title": "undated"},
+        ]
+
+        def rows_for(sql, params=()):
+            if "FROM incident_updates" in sql:
+                return updates
+            if "FROM incidents WHERE" in sql:
+                return [incident]
+            return []
+
+        with mock.patch.object(api, "query", side_effect=rows_for) as mocked:
+            response = self.client.get("/api/v1/incidents/7", headers=self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([u["id"] for u in response.json["updates"]], [12, 13])
+        update_call = mocked.call_args_list[1]
+        update_sql = " ".join(update_call.args[0].split())
+        self.assertIn("ORDER BY published_at ASC NULLS LAST, ingested_at ASC, id ASC",
+                      update_sql)
+        self.assertNotIn("created_at", update_sql)
+        self.assertEqual(update_call.args[1], (7,))
+
     def test_history_json_and_csv(self):
         with mock.patch.object(dashboard, "history_context", return_value={"report": report()}):
             response = self.client.get("/api/v1/history?range=year", headers=self.headers)
