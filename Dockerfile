@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY poller.py feeds.py db.py dashboard.py history.py notifiers.py settings.py admin.py api.py api_errors.py oidc.py cli.py skyfarer_mcp.py wsgi.py ./
+COPY poller.py feeds.py db.py dashboard.py history.py notifiers.py providers.py settings.py admin.py api.py api_errors.py oidc.py cli.py skyfarer_mcp.py wsgi.py ./
 COPY docs/openapi.json docs/openapi.json
 COPY templates/ templates/
 COPY static/ static/
