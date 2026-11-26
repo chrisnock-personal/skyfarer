@@ -261,9 +261,9 @@ def _resolve_unlisted_azure(conn, listed: set[str], dry_run: bool,
                             watched: list[str] | None = None) -> int:
     """Azure's feed only lists events in progress, so an open incident whose
     regions have nothing listed any more has ended, whether or not a
-    "Mitigated" entry was ever published. An unwatched region's entries are no
-    longer read, though: its absence from `listed` says nothing about an event
-    still running there, so only incidents in regions still watched can close."""
+    "Mitigated" entry was ever published. An unwatched region isn't in
+    `listed` even while its event runs, so for those regions the feed text is
+    checked directly: the incident stays open until no entry names them."""
     if watched is None:
         watched = feeds.AZURE_REGIONS
     watched_regions = {r.lower() for r in watched}
@@ -271,10 +271,12 @@ def _resolve_unlisted_azure(conn, listed: set[str], dry_run: bool,
     for rec in db.get_open_guids(conn).values():
         if rec["provider"] != "Azure" or _regions(rec["region"]) & listed:
             continue
-        regions = {r.lower() for r in _regions(rec["region"])}
-        if "*" not in watched_regions and not regions <= watched_regions:
-            log.info("Keeping open: [%s] %s has an unwatched region", rec["provider"],
-                     rec["region"])
+        unwatched = [r for r in _regions(rec["region"])
+                     if r.lower() not in watched_regions]
+        if ("*" not in watched_regions
+                and any(feeds.azure_feed_mentions(r) for r in unwatched)):
+            log.info("Keeping open: [%s] %s is unwatched but still in the feed",
+                     rec["provider"], rec["region"])
             continue
         _resolve_incident(conn, rec, _ended_entry(rec, feeds.AZURE_STATUS_PAGE, "Azure"),
                           dry_run)

@@ -36,8 +36,9 @@ class AzureUnlistedResolution(unittest.TestCase):
                 "region": region, "title": "Elevated storage latency in West US",
                 "summary": "Investigating"}
 
-    def poll(self, *, watched, listed, region):
+    def poll(self, *, watched, listed, region, feed_texts=("Elevated storage latency in West US",)):
         with mock.patch.object(feeds, "AZURE_REGIONS", watched), \
+                mock.patch.object(feeds, "AZURE_FEED_TEXTS", list(feed_texts)), \
                 mock.patch.object(poller, "_seed_discovery"), \
                 mock.patch.object(poller.providers, "discover", return_value=({}, {}, set())), \
                 mock.patch.object(poller, "fetch_all", return_value=([], listed, None)), \
@@ -63,6 +64,13 @@ class AzureUnlistedResolution(unittest.TestCase):
         self.assertEqual((created, resolved), (0, 0))
         mark_resolved.assert_not_called()
         self.assertEqual([call.args[2] for call in enqueue.call_args_list], [])
+
+    def test_unwatched_region_closes_once_its_event_leaves_the_feed(self):
+        created, resolved, mark_resolved, enqueue = self.poll(
+            watched=["East US"], listed=set(), region="West US", feed_texts=())
+        self.assertEqual((created, resolved), (0, 1))
+        mark_resolved.assert_called_once()
+        self.assertEqual([call.args[2] for call in enqueue.call_args_list], ["resolved"])
 
     def test_partly_unwatched_region_stays_open(self):
         created, resolved, mark_resolved, enqueue = self.poll(
@@ -103,6 +111,9 @@ class AzureUnlistedResolution(unittest.TestCase):
             entries, listed = feeds.fetch_azure_entries(feeds.FeedErrors())
         self.assertEqual(entries, [])
         self.assertEqual(listed, set())
+        # ...but the unwatched region's event is still known to be running.
+        self.assertTrue(feeds.azure_feed_mentions("West US"))
+        self.assertFalse(feeds.azure_feed_mentions("East US"))
 
 
 if __name__ == "__main__":
