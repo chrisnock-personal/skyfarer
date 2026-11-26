@@ -406,6 +406,18 @@ def fetch_ovh_entries(errors: FeedErrors) -> list[FeedEntry]:
     return entries
 
 
+# Every entry's text from the last successful Azure read, watched region or
+# not, so an incident in a region that has since been unwatched can still be
+# closed once its event has really left the feed (azure_feed_mentions()).
+AZURE_FEED_TEXTS: list[str] = []
+
+
+def azure_feed_mentions(region: str) -> bool:
+    """Whether the last Azure feed read has any entry naming `region`."""
+    pattern = azure_region_pattern(region)
+    return any(pattern.search(text) for text in AZURE_FEED_TEXTS)
+
+
 def fetch_azure_entries(errors: FeedErrors) -> tuple[list[FeedEntry], Optional[set[str]]]:
     """Returns the entries to process, and every region the feed currently
     lists an event for. The second value is None unless the feed was
@@ -424,9 +436,12 @@ def fetch_azure_entries(errors: FeedErrors) -> tuple[list[FeedEntry], Optional[s
 
     patterns = {r: azure_region_pattern(r) for r in AZURE_REGIONS if r != "*"}
     listed: set[str] = set()
+    global AZURE_FEED_TEXTS
+    AZURE_FEED_TEXTS = []
     for entry in feed.entries:
         title = entry.get("title", "(no title)")
         summary = _clean(entry.get("summary", entry.get("description", "")))
+        AZURE_FEED_TEXTS.append(f"{title} {summary}")
         if "*" in AZURE_REGIONS:
             matched = ["all"]
         else:
