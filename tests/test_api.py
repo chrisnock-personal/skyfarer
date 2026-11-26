@@ -21,6 +21,10 @@ import history  # noqa: E402
 import notifiers  # noqa: E402
 import settings  # noqa: E402
 
+# setUp() mocks settings.user; keep the real function so write-endpoint tests
+# can exercise the row its query actually returns.
+REAL_USER = settings.user
+
 NOW = datetime(2026, 11, 24, 12, tzinfo=timezone.utc)
 
 
@@ -447,6 +451,36 @@ class ApiAdmin(unittest.TestCase):
         self.assertEqual(token.json["token"], "sk_live_new")
         self.assertEqual(token.json["scopes"], ["incidents:read"])  # viewer ceiling
         self.assertEqual(self.client.delete("/api/v1/tokens/3", headers=self.headers).status_code, 200)
+
+    def test_patch_user_new_setup_link_succeeds(self):
+        # patch_user() reads person["active"], which has to come from the
+        # real settings.user() query — not just from a convenient mock row.
+        def rows(conn, sql, params=None):
+            self.assertIn("password_hash IS NOT NULL AS active", sql)
+            return [{"id": 5, "email": "ci@example.test", "name": "CI", "role": "viewer",
+                     "kind": "human", "active": False}]
+
+        with mock.patch.object(settings, "_rows", side_effect=rows), \
+                mock.patch.object(settings, "user", side_effect=REAL_USER):
+            response = self.client.patch("/api/v1/users/5", headers=self.headers,
+                                         json={"new_setup_link": True})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("/welcome/new-link", response.json["setup_url"])
+        self.assertEqual(admin.settings.new_setup_link.call_args.args[1], 5)
+
+    def test_patch_user_new_setup_link_rejects_password_user(self):
+        def rows(conn, sql, params=None):
+            self.assertIn("password_hash IS NOT NULL AS active", sql)
+            return [{"id": 5, "email": "ci@example.test", "name": "CI", "role": "viewer",
+                     "kind": "human", "active": True}]
+
+        with mock.patch.object(settings, "_rows", side_effect=rows), \
+                mock.patch.object(settings, "user", side_effect=REAL_USER):
+            response = self.client.patch("/api/v1/users/5", headers=self.headers,
+                                         json={"new_setup_link": True})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Only accounts without a password", response.json["detail"])
+        admin.settings.new_setup_link.assert_not_called()
 
     def test_rate_limit_returns_retry_after(self):
         admin.db.api_rate_limit.return_value = (False, 12)

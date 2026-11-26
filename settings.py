@@ -703,7 +703,9 @@ def users(conn) -> list[dict]:
 
 
 def user(conn, user_id: int) -> Optional[dict]:
-    rows = _rows(conn, "SELECT id, email, name, role, kind FROM users WHERE id = %s", (user_id,))
+    rows = _rows(conn, """SELECT id, email, name, role, kind,
+                                 password_hash IS NOT NULL AS active
+                          FROM users WHERE id = %s""", (user_id,))
     return rows[0] if rows else None
 
 
