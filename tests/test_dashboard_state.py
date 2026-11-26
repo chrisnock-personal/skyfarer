@@ -151,5 +151,26 @@ class Web(unittest.TestCase):
         clear.assert_called_once_with(self.conn)
 
 
+class ChannelTest(unittest.TestCase):
+    """A configured channel's Test button must send without a NameError."""
+
+    def test_run_test_sends_through_an_enabled_channel(self):
+        app = Flask(__name__, template_folder=os.path.join(ROOT, "templates"))
+        app.secret_key = "test-secret"
+        app.register_blueprint(admin.bp)
+        sender = mock.Mock(return_value=42)
+        with app.test_request_context("/settings/channels/zendesk/test"), \
+                mock.patch.object(admin.notifiers, "enabled_channels",
+                                  return_value=["zendesk"]), \
+                mock.patch.object(admin.notifiers, "sender_for", return_value=sender):
+            ok, message = admin.run_test("zendesk")
+        self.assertTrue(ok)
+        self.assertTrue(message.startswith("Test ticket #42 opened and set to pending."), message)
+        self.assertRegex(message, r"\((?:\d+ ms|\d+\.\d s)\)$")
+        self.assertEqual(sender.call_count, 2)
+        self.assertEqual([c.args[0]["event"] for c in sender.call_args_list],
+                         ["opened", "resolved"])
+
+
 if __name__ == "__main__":
     unittest.main()
