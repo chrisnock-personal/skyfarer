@@ -257,13 +257,24 @@ def _ended_entry(rec: dict, page: str, provider_label: str) -> FeedEntry:
     )
 
 
-def _resolve_unlisted_azure(conn, listed: set[str], dry_run: bool) -> int:
+def _resolve_unlisted_azure(conn, listed: set[str], dry_run: bool,
+                            watched: list[str] | None = None) -> int:
     """Azure's feed only lists events in progress, so an open incident whose
     regions have nothing listed any more has ended, whether or not a
-    "Mitigated" entry was ever published."""
+    "Mitigated" entry was ever published. An unwatched region's entries are no
+    longer read, though: its absence from `listed` says nothing about an event
+    still running there, so only incidents in regions still watched can close."""
+    if watched is None:
+        watched = feeds.AZURE_REGIONS
+    watched_regions = {r.lower() for r in watched}
     resolved = 0
     for rec in db.get_open_guids(conn).values():
         if rec["provider"] != "Azure" or _regions(rec["region"]) & listed:
+            continue
+        regions = {r.lower() for r in _regions(rec["region"])}
+        if "*" not in watched_regions and not regions <= watched_regions:
+            log.info("Keeping open: [%s] %s has an unwatched region", rec["provider"],
+                     rec["region"])
             continue
         _resolve_incident(conn, rec, _ended_entry(rec, feeds.AZURE_STATUS_PAGE, "Azure"),
                           dry_run)
@@ -360,7 +371,8 @@ def poll_once(dry_run: bool = False) -> tuple[int, int]:
                 resolved += done
 
             if azure_listed is not None:
-                resolved += _resolve_unlisted_azure(conn, azure_listed, dry_run)
+                resolved += _resolve_unlisted_azure(conn, azure_listed, dry_run,
+                                                   feeds.AZURE_REGIONS)
             if hetzner_listed is not None:
                 resolved += _resolve_unlisted_hetzner(conn, hetzner_listed, dry_run)
 
